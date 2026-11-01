@@ -313,46 +313,46 @@ console.log("");
 console.log("两个子站的 key");
 
 const dKey = parseDiscoveryKey({
-  id: "ak_01M4YZ2TJVMFCQAVWXD9956GXX",
+  id: "ak_TESTONLY000000000000000000",
   name: "pi",
-  masked_key: "sk-...9b42",
+  masked_key: "sk-...0000",
   status: "active",
-  created_at: "2026-10-15T05:03:14.011Z",
-  last_used_at: "2026-10-22T08:20:37.611Z",
+  created_at: "2026-01-01T00:00:00.000Z",
+  last_used_at: "2026-01-01T00:00:01.000Z",
 });
-check("Discovery key 的 id 读到了", dKey.id === "ak_01M4YZ2TJVMFCQAVWXD9956GXX");
+check("Discovery key 的 id 读到了", dKey.id === "ak_TESTONLY000000000000000000");
 check("Discovery key 的名字读到了", dKey.name === "pi");
-check("Discovery key 的掩码读到了", dKey.maskedKey === "sk-...9b42");
+check("Discovery key 的掩码读到了", dKey.maskedKey === "sk-...0000");
 check("Discovery key 的状态读到了", dKey.status === "active");
-check("Discovery key 的时间读到了", dKey.createdAt === "2026-10-15T05:03:14.011Z");
+check("Discovery key 的时间读到了", dKey.createdAt === "2026-01-01T00:00:00.000Z");
 check("列表里没有完整的 key", dKey.plainKey === undefined);
 const createdKey = parseDiscoveryKey({
-  id: "ak_01M5HBMBKQSBGMXJXB1VVCQPGS",
-  name: "buddy-proxy",
+  id: "ak_TESTONLY111111111111111111",
+  name: "test-key",
   key: "sk-fullvalue",
-  masked_key: "sk-...369c",
+  masked_key: "sk-...1111",
   status: "active",
 });
 check("创建的回答里带着完整的 key", createdKey.plainKey === "sk-fullvalue");
-check("创建的回答里 id 也在", createdKey.id === "ak_01M5HBMBKQSBGMXJXB1VVCQPGS");
+check("创建的回答里 id 也在", createdKey.id === "ak_TESTONLY111111111111111111");
 
 // Chat：列表里的 token 是掩过的，创建的那次是完整的
 const cToken = parseChatToken({
-  id: "dnwpi4yU81H6ivgnK0COOYpPQh1Z89ONciSGUKmgFFA=",
+  id: "dGVzdC1vbmx5LWNoYXQtdG9rZW4taWQwMDAwMDA=",
   token: "sk...aaaa",
   auth_status: 1,
-  token_name: "buddy-proxy",
-  created_at: "2026-10-22T08:28:51.494Z",
+  token_name: "test-token",
+  created_at: "2026-01-01T00:00:02.000Z",
   expired_at: "-",
 });
-check("Chat token 的 id 读到了", cToken.id.startsWith("dnwpi4yU81H6"));
-check("Chat token 的名字读到了", cToken.name === "buddy-proxy");
+check("Chat token 的 id 读到了", cToken.id.startsWith("dGVzdC1vbmx5"));
+check("Chat token 的名字读到了", cToken.name === "test-token");
 check("Chat token 的掩码是平台给的", cToken.maskedToken === "sk...aaaa");
 check("Chat token 的权限是数字", cToken.authStatus === 1);
 check("Chat token 的有效期是「-」", cToken.expiredAt === "-");
 check("Chat token 列表里没有完整的 token", cToken.plainToken === undefined);
 const cCreated = parseChatToken(
-  { id: "t2", token: "sk-TESTONLYaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", token_name: "buddy-proxy" },
+  { id: "t2", token: "sk-TESTONLYaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", token_name: "test-token" },
   true,
 );
 check("Chat 创建的完整 token 读到了", cCreated.plainToken === "sk-TESTONLYaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
