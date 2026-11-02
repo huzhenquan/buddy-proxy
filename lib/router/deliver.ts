@@ -46,13 +46,74 @@ function sseHead(ctx: Koa.Context): void {
   ctx.res.flushHeaders?.();
 }
 
-/** Write a frame, and say whether the client is still there. */
+/**
+ * Write a frame, and say whether the client is still there.
+ *
+ * `res.write()` 返回 false 的意思是「发送缓冲区满了，该等 drain 了」——
+ * **不是**「客户端走了」。把 false 当成「客户端没了」，长答复就会被砍在
+ * 中间：客户端只是读得慢（Claude Code 在渲染长输出时就会慢），窗口满了，
+ * 网关以为对方不要了，直接 break 掉循环。
+ *
+ * 后果是客户端收到一条断掉的流：HTTP 200，拿到部分正文，没有收尾帧
+ * （message_delta / message_stop / [DONE]）。Claude Code 那侧记成
+ * `stream_truncated` + `truncatedAfterOutput`，代理那侧记成
+ * `output_estimated=1`（usage 没等到，只能估算）。
+ *
+ * 所以这里分两件事：
+ *   · 缓冲区满了 → 等 drain，等完再写下一帧；
+ *   · 连接真的断了（res  destroyed / writableEnded）→ 才算客户端没了。
+ */
 function writeSafe(ctx: Koa.Context, chunk: string | Uint8Array): boolean {
+  const res = ctx.res;
+  if (res.writableEnded || res.destroyed) return false;
   try {
-    return ctx.res.write(chunk);
+    // 写不进去（缓冲区满了）是常态，不是失败：这一次也写进去了，返回
+    // false 只是说「等 drain」。调用方不该因为它而停止。
+    res.write(chunk);
+    return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * 等发送缓冲区排空。
+ *
+ * 客户端读得慢时，写出去的数据在 Node 的缓冲区里排队；缓冲满了就该等
+ * `drain` 事件，而不是把流砍掉。连接断了就没有 drain，所以也听 close。
+ */
+function waitForDrain(ctx: Koa.Context): Promise<void> {
+  const res = ctx.res;
+  if (res.writableEnded || res.destroyed) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      res.off("drain", done);
+      res.off("close", done);
+      res.off("error", done);
+      resolve();
+    };
+    res.once("drain", done);
+    res.once("close", done);
+    res.once("error", done);
+  });
+}
+
+/** 写一帧，缓冲区满了就等它排空。返回 false 表示客户端真的走了。 */
+async function writeFrame(ctx: Koa.Context, chunk: string | Uint8Array): Promise<boolean> {
+  const res = ctx.res;
+  if (res.writableEnded || res.destroyed) return false;
+  let full = false;
+  try {
+    full = !res.write(chunk);
+  } catch {
+    return false;
+  }
+  if (full) {
+    // 缓冲区满了：等它排空，别把流砍了。
+    await waitForDrain(ctx);
+    return !(res.writableEnded || res.destroyed);
+  }
+  return true;
 }
 
 /**
@@ -279,12 +340,12 @@ export async function deliverOpenAIStream(
   }
   try {
     for await (const chunk of openaiStreamToAnthropic(watchFinish(readOpenAIChunks(upstream), onFinish, onUsage), model)) {
-      if (!writeSafe(ctx, chunk)) break;
+      if (!(await writeFrame(ctx, chunk))) break;
     }
   } catch (e) {
     // The headers are already out, so the failure goes back as an error event.
     console.warn(`[DELIVER] 发给客户端的错误事件：${failureLine(e)}`);
-    writeSafe(ctx, errorEvent((e as Error)?.message));
+    await writeFrame(ctx, errorEvent((e as Error)?.message));
     reportFailure(onFailure, e);
   }
   ctx.res.end();
@@ -328,11 +389,11 @@ export async function deliverAnthropicStream(
   }
   try {
     for await (const chunk of anthropicStreamToOpenAI(body, model, onUsage)) {
-      if (!writeSafe(ctx, chunk)) break;
+      if (!(await writeFrame(ctx, chunk))) break;
     }
   } catch (e) {
     console.warn(`[DELIVER] 发给客户端的错误事件：${failureLine(e)}`);
-    writeSafe(ctx, errorEvent((e as Error)?.message));
+    await writeFrame(ctx, errorEvent((e as Error)?.message));
     reportFailure(onFailure, e);
   }
   ctx.res.end();
@@ -370,12 +431,12 @@ export async function deliverOpenAIChunks(
       for await (const chunk of chunks) {
         if (chunk?.usage && onUsage) onUsage(chunk.usage);
         if (model && chunk && typeof chunk === "object") chunk.model = model;
-        if (!writeSafe(ctx, sseData(chunk))) break;
+        if (!(await writeFrame(ctx, sseData(chunk)))) break;
       }
-      writeSafe(ctx, SSE_DONE);
+      await writeFrame(ctx, SSE_DONE);
     } catch (e) {
       console.warn(`[DELIVER] 发给客户端的错误事件：${failureLine(e)}`);
-      writeSafe(ctx, errorEvent((e as Error)?.message));
+      await writeFrame(ctx, errorEvent((e as Error)?.message));
       reportFailure(onFailure, e);
     }
     ctx.res.end();
@@ -383,11 +444,11 @@ export async function deliverOpenAIChunks(
   }
   try {
     for await (const chunk of openaiStreamToAnthropic(chunks, model)) {
-      if (!writeSafe(ctx, chunk)) break;
+      if (!(await writeFrame(ctx, chunk))) break;
     }
   } catch (e) {
     console.warn(`[DELIVER] 发给客户端的错误事件：${failureLine(e)}`);
-    writeSafe(ctx, errorEvent((e as Error)?.message));
+    await writeFrame(ctx, errorEvent((e as Error)?.message));
     reportFailure(onFailure, e);
   }
   ctx.res.end();
@@ -444,13 +505,13 @@ async function pipeOpenAIChunks(
   try {
     for await (const chunk of watchFinish(readOpenAIChunks(body), onFinish, onUsage)) {
       if (model && chunk && typeof chunk === "object") chunk.model = model;
-      if (!writeSafe(ctx, sseData(chunk))) break;
+      if (!(await writeFrame(ctx, sseData(chunk)))) break;
     }
-    writeSafe(ctx, SSE_DONE);
+    await writeFrame(ctx, SSE_DONE);
   } catch (e) {
     console.warn(`[DELIVER] 发给客户端的错误事件：${failureLine(e)}`);
-    writeSafe(ctx, sseData({ error: { type: "api_error", message: (e as Error)?.message ?? "upstream failed" } }));
-    writeSafe(ctx, SSE_DONE);
+    await writeFrame(ctx, sseData({ error: { type: "api_error", message: (e as Error)?.message ?? "upstream failed" } }));
+    await writeFrame(ctx, SSE_DONE);
     reportFailure(onFailure, e);
   } finally {
     // The response has to end, or the client waits for a connection that never
@@ -510,12 +571,12 @@ async function writeAnthropicFrames(
         }
       }
       const frame = event.event ? `event: ${event.event}\ndata: ${data}\n\n` : `data: ${data}\n\n`;
-      if (!writeSafe(ctx, frame)) break;
+      if (!(await writeFrame(ctx, frame))) break;
       lastActivity = Date.now();
     }
   } catch (e) {
     console.warn(`[DELIVER] 发给客户端的错误事件：${failureLine(e)}`);
-    writeSafe(ctx, errorEvent((e as Error)?.message));
+    await writeFrame(ctx, errorEvent((e as Error)?.message));
     reportFailure(onFailure, e);
   } finally {
     if (pingTimer) clearInterval(pingTimer);
