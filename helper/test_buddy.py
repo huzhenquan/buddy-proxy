@@ -11,6 +11,7 @@ import datetime
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import typing
@@ -432,11 +433,11 @@ class SendCommandTest(unittest.TestCase):
             ],
         )
 
-    def test_opencode_uses_run_with_prompt(self):
+    def test_opencode_uses_run_and_the_message_is_positional(self):
         session = {"client": "opencode", "id": "ses_e8f1b3e2cffeh5"}
         self.assertEqual(
             buddy_todo.send_command("opencode", session, "继续"),
-            ["opencode", "run", "-s", "ses_e8f1b3e2cffeh5", "--prompt", "继续"],
+            ["opencode", "run", "-s", "ses_e8f1b3e2cffeh5", "--", "继续"],
         )
 
     def test_new_pi_session_uses_session_id(self):
@@ -445,6 +446,70 @@ class SendCommandTest(unittest.TestCase):
             buddy_todo.send_command("pi", session, "继续"),
             ["pi", "-p", "--session-id", "new-id", "--", "继续"],
         )
+
+
+class OpenCodeFlagsTest(unittest.TestCase):
+    """我们传的 flag 必须真的存在于 `opencode run`。
+
+    之前 send_command 传了 --prompt（opencode run 的消息是位置参数，没有这个
+    flag），真实发送时退 1、stderr 只有 "ERROR"，而单测断言的正是那条错命令，
+    所以一路绿灯。这里改成对着 --help 校验，flag 不存在就红。
+    """
+
+    help_text: str
+
+    def setUp(self):
+        self.help_text = self._help()
+
+    def _help(self) -> str:
+        try:
+            out = subprocess.run(
+                ["opencode", "run", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            self.skipTest("本机没有 opencode，跳过 flag 校验")
+        text = out.stdout + out.stderr
+        if "[<message...>]" not in text:
+            self.skipTest("opencode run --help 的输出形状变了，跳过")
+        return text
+
+    def _documented(self):
+        # 帮助里每行形如 "  --session, -s string    会话 id"
+        long_flags, short_flags = set(), set()
+        for line in self.help_text.splitlines():
+            for token in line.replace(",", " ").split():
+                if token.startswith("--"):
+                    long_flags.add(token.rstrip(","))
+                elif token.startswith("-") and len(token) == 2:
+                    short_flags.add(token)
+        return long_flags, short_flags
+
+    def test_the_message_is_a_positional_argument(self):
+        self.assertIn("message", self.help_text)
+        self.assertIn("[<message...>]", self.help_text)
+
+    def test_every_flag_we_pass_is_documented(self):
+        session = {"client": "opencode", "id": "ses_e8f1b3e2cffeh5"}
+        argv = buddy_todo.send_command("opencode", session, "继续")
+        long_flags, short_flags = self._documented()
+        for part in argv[1:]:
+            if part == "--":
+                # 标准的「后面全是位置参数」分隔符，不是 flag
+                continue
+            if part.startswith("--"):
+                self.assertIn(part, long_flags, f"{part} 不是 opencode run 的 flag")
+            elif part.startswith("-") and len(part) == 2:
+                self.assertIn(part, short_flags, f"{part} 不是 opencode run 的 flag")
+
+    def test_the_prompt_is_the_last_argument(self):
+        session = {"client": "opencode", "id": "ses_e8f1b3e2cffeh5"}
+        argv = buddy_todo.send_command("opencode", session, "继续")
+        self.assertEqual(argv[-1], "继续")
+        self.assertEqual(argv[0], "opencode")
+        self.assertEqual(argv[1], "run")
 
 
 class ArchiveTest(unittest.TestCase):

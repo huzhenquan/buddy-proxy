@@ -280,7 +280,9 @@ def send_command(client: str, session: dict, prompt: str) -> list:
     「Fork this session into current directory? [y/N]」，非交互的进程就挂死了。
     """
     if client == "opencode":
-        return ["opencode", "run", "-s", session["id"], "--prompt", prompt]
+        # `opencode run` 的消息是位置参数（USAGE: opencode run [flags] [<message...>]），
+        # 没有 --prompt 这个 flag。写成一行的 --prompt 会让它退 1 并只吐 "ERROR"。
+        return ["opencode", "run", "-s", session["id"], "--", prompt]
     if session.get("new"):
         return ["pi", "-p", "--session-id", session["id"], "--", prompt]
     return ["pi", "-p", "--session", session["path"], "--", prompt]
