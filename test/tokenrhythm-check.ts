@@ -82,12 +82,15 @@ console.log("没用的账号");
 const mixed = [
   tenant(1, 0, 0, soon), // 没钱
   tenant(2, 18, 18, soon, { hasKey: false }), // 没有 key
-  tenant(3, 18, 18, soon, { error: "登录过期" }), // 查询出错
+  // 查询出错：余额读不到（wallet 为空），那是「不知道」不是「没钱」——
+  // usableAccounts 照样让它接，orderedAccounts 把它排到最后（lib/tokenrhythm/wallet.ts）。
+  tenant(3, 0, 0, null, { error: "登录过期", wallet: null }),
   tenant(4, 5, 5, later), // 能用
   tenant(5, 30, 0, never), // 只有充值的本金，也能用
 ];
-check("没钱、没 key、出错的都排除", usableAccounts(mixed).length === 2, String(usableAccounts(mixed).length));
-check("剩下的是有赠金的那个", usableAccounts(mixed)[0]?.accountId === "tokenrhythm-4", String(usableAccounts(mixed)[0]?.accountId));
+check("没钱、没 key 的排除，余额读不到的留着", usableAccounts(mixed).length === 3, String(usableAccounts(mixed).length));
+check("余额读不到的排最后", orderedAccounts(mixed).at(-1)?.accountId === "tokenrhythm-3", String(orderedAccounts(mixed).at(-1)?.accountId));
+check("排第一的是有赠金的那个", orderedAccounts(mixed)[0]?.accountId === "tokenrhythm-4", String(orderedAccounts(mixed)[0]?.accountId));
 // 都没有赠金的时候，充值的本金才上场。
 const noGift = [tenant(1, 30, 0, never), tenant(2, 40, 0, never)];
 check("没有赠金就用充值的本金", usableAccounts(noGift).length === 2, String(usableAccounts(noGift).length));
@@ -102,8 +105,8 @@ check(
   !after.some((t: any) => t.accountId === "tokenrhythm-4"),
   JSON.stringify(after.map((t: any) => t.accountId)),
 );
-check("其它账号不受影响", after.length === 1, String(after.length));
-check("剩下的是那个", after[0]?.accountId === "tokenrhythm-5", String(after[0]?.accountId));
+check("其它账号不受影响", after.length === 2, String(after.length));
+check("剩下的是本金那个和读不到余额那个", after.map((t: any) => t.accountId).join(",") === "tokenrhythm-3,tokenrhythm-5", after.map((t: any) => t.accountId).join(","));
 
 console.log("");
 console.log("余额不足的错误");
@@ -114,6 +117,10 @@ check("带着 traceId", err.traceId === "trace_123");
 check("是它自己的类型", err instanceof TokenRhythmNoBalanceError);
 check("是 Error", err instanceof Error);
 
+// Close the database before removing its directory: on Windows an open
+// file cannot be deleted (EPERM), so the handle has to go first.
+const { closeStore } = await import("../lib/store.ts");
+closeStore();
 fs.rmSync(tmp, { recursive: true, force: true });
 
 console.log("");

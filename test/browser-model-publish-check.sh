@@ -15,7 +15,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 FAKE_PORT="${FAKE_PORT:-6798}"
-DATA_DIR="${DATA_DIR:-/tmp/opencode/e2e-browser-model}"
+# 不认外面的 DATA_DIR：下面会 rm -rf 它，环境里同名变量可能指向别的目录。
+# 固定在仓库内 test/.tmp 下新建一个（路径相对仓库根，见 test/smoke.sh）。
+mkdir -p test/.tmp
+# 绝对路径：HAR 由 agent-browser 守护进程写，它的 cwd 不是仓库根。
+DATA_DIR="$(cd "$(mktemp -d "test/.tmp/e2e-browser-model.XXXXXX")" && pwd)"
 SESSION="${BROWSER_SESSION:-e2e-model-check}"
 # 网关的端口由 test/serve.ts 挑（共享 helper），起来之后才知道基址。
 BASE=""
@@ -52,7 +56,6 @@ jsq() {
 }
 
 # ── 假的上游与网关 ──────────────────────────────────────────────────────
-rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR"
 
 node --experimental-strip-types test/fake-qoder-upstream.ts "$FAKE_PORT" > "$DATA_DIR/fake.log" 2>&1 &
@@ -85,6 +88,8 @@ ROUTER_PID=$!
 cleanup() {
   kill $ROUTER_PID $FAKE_PID 2>/dev/null
   wait $ROUTER_PID $FAKE_PID 2>/dev/null
+  # 目录是这个脚本自己建的（serve.ts 拿到 --data-dir 不会替我们删），里面有种子会话。
+  rm -rf "$DATA_DIR"
 }
 trap cleanup EXIT
 
@@ -188,9 +193,9 @@ check "回来的 model 是客户端问的那个对外 id" "$(echo "$ANSWER" | py
 check "回来的不是上游内部的名字" "$(echo "$ANSWER" | python3 -c 'import json,sys; m=json.load(sys.stdin)["model"]; print(m in ("gmodel","glm-5.3"))')" "False"
 
 # 假上游确实收到了这个请求。
-SAW=$(python3 - <<'PY'
-import re
-log = open('/tmp/opencode/e2e-browser-model/fake.log').read()
+SAW=$(python3 - "$DATA_DIR/fake.log" <<'PY'
+import re, sys
+log = open(sys.argv[1]).read()
 print('ok' if log else 'empty')
 PY
 )

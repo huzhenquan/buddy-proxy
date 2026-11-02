@@ -284,5 +284,9 @@ console.log("结果");
 console.log(`pass=${pass} fail=${fail}`);
 if (previousDataDir === undefined) delete process.env.BUDDY_DATA_DIR;
 else process.env.BUDDY_DATA_DIR = previousDataDir;
+// Close the database before removing its directory: on Windows an open
+// file cannot be deleted (EPERM), so the handle has to go first.
+const { closeStore } = await import("../lib/store.ts");
+closeStore();
 rmSync(scratchDir, { recursive: true, force: true });
 process.exit(fail ? 1 : 0);

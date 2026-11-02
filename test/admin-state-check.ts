@@ -454,14 +454,15 @@ check("上游关着 → UNPUBLISHED_REASON_UPSTREAM_DISABLED", (await reasonOf("
 await saveModel("r-target-off", true, [{ ...qoderTarget, enabled: false }]);
 check("目标被停用 → UNPUBLISHED_REASON_TARGET_DISABLED", (await reasonOf("r-target-off")) === "UNPUBLISHED_REASON_TARGET_DISABLED", await reasonOf("r-target-off"));
 
-// 4. 上游不列这个模型了。
-//    面板的接口不收上游没有的模型（那是它该拦的），所以直接写库：先存一个
-//    真的，再把目标改成上游不认的模型。
+// 4. 上游目录不列这个模型。
+//    目录不是上游能服务什么的完整清单（5784714：workbuddy.cn 实测能答目录里
+//    没有的模型），所以「目录里没有」不再算没公布的理由 —— 照样公布，理由留空。
+//    面板的接口会拦没人声明过的名字，所以直接写库。
 await setEnabled("qoder", true);
 await saveModel("r-gone", true, [qoderTarget]);
 retarget("r-gone", "no-such-model");
 await saveModel("r-reload", true, [qoderTarget]); // 存一次 = 重读一次目录
-check("上游没这个模型 → UNPUBLISHED_REASON_MODEL_GONE", (await reasonOf("r-gone")) === "UNPUBLISHED_REASON_MODEL_GONE", await reasonOf("r-gone"));
+check("目录里没有这个模型 → 照样公布（不是 MODEL_GONE）", (await reasonOf("r-gone")) === "", await reasonOf("r-gone"));
 
 // 5. 上游没登录。
 deleteSecret("session:provider:qoder");

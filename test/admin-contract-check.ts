@@ -11,6 +11,7 @@
 
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,17 +20,16 @@ import { TokenPlanWindowSchema, UpstreamQuotaSchema } from "../lib/gen/buddy/adm
 import { startGateway as startHarness, type Gateway } from "./harness.ts";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const DATA_DIR = "/tmp/opencode/test-admin-contract";
+// 临时目录走系统的 tmpdir：写死 /tmp 在 Windows 上落到当前盘的根上。
+const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "test-admin-contract-"));
 const SERVICE = "/buddy.admin.v1.AdminService";
 const PROTO = path.join(ROOT, "proto/buddy/admin/v1/admin.proto");
 
 // This process runs the panel's own logic too (the check-in summary), so it
 // needs a data dir of its own. The gateway below runs in another process with
 // DATA_DIR -- the two must not share one database.
-const LOCAL_DATA_DIR = "/tmp/opencode/test-admin-contract-local";
+const LOCAL_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "test-admin-contract-local-"));
 process.env.BUDDY_DATA_DIR = LOCAL_DATA_DIR;
-fs.rmSync(LOCAL_DATA_DIR, { recursive: true, force: true });
-fs.mkdirSync(LOCAL_DATA_DIR, { recursive: true, mode: 0o700 });
 
 let pass = 0;
 let fail = 0;
@@ -227,8 +227,6 @@ function messageError(message: Message, value: unknown, where: string): string |
  * 网关
  * ------------------------------------------------------------------ */
 
-fs.rmSync(DATA_DIR, { recursive: true, force: true });
-fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 
 // 起网关交给共用的 helper：端口被抢就换号重试，失败一定收尾。
 let router: Gateway;
@@ -739,25 +737,36 @@ check("/health 里没有令牌", !health.text.includes(token));
 console.log("");
 console.log("面板的静态托管");
 
+// 静态托管读的是 web/dist：没先 web:build 就没有可托管的东西，这一段只能跳过
+// （mise run build / web:build 之后再跑就会测到）。跳过要说出来，不能装作过了。
+const DIST_INDEX = path.join(ROOT, "web", "dist", "index.html");
+const HAS_DIST = fs.existsSync(DIST_INDEX);
+let skippedStatic = 0;
+function checkStatic(name: string, ok: boolean, detail = ""): void {
+  if (HAS_DIST) return check(name, ok, detail);
+  skippedStatic++;
+}
+
+
 const index = await raw("/admin");
-check("/admin 答得上来", index.status === 200, String(index.status));
-check("/admin 答的是 HTML", index.type.includes("text/html"), index.type);
+checkStatic("/admin 答得上来", index.status === 200, String(index.status));
+checkStatic("/admin 答的是 HTML", index.type.includes("text/html"), index.type);
 const indexSlash = await raw("/admin/");
-check("/admin/ 答得上来", indexSlash.status === 200, String(indexSlash.status));
+checkStatic("/admin/ 答得上来", indexSlash.status === 200, String(indexSlash.status));
 const deep = await raw("/admin/config");
-check("/admin/config 是深链接", deep.status === 200, String(deep.status));
-check("/admin/config 答的是 index.html", deep.text.includes("<div id=\"root\">"), deep.text.slice(0, 120));
+checkStatic("/admin/config 是深链接", deep.status === 200, String(deep.status));
+checkStatic("/admin/config 答的是 index.html", deep.text.includes("<div id=\"root\">"), deep.text.slice(0, 120));
 const deepUsage = await raw("/admin/usage?window=day");
-check("/admin/usage 带查询串也答得上来", deepUsage.status === 200, String(deepUsage.status));
+checkStatic("/admin/usage 带查询串也答得上来", deepUsage.status === 200, String(deepUsage.status));
 
 const assetMatch = /src="(\/admin\/assets\/[^"]+\.js)"/.exec(index.text);
-check("index.html 里的静态资源带 /admin/ 前缀", Boolean(assetMatch), index.text.slice(0, 200));
+checkStatic("index.html 里的静态资源带 /admin/ 前缀", Boolean(assetMatch), index.text.slice(0, 200));
 if (assetMatch) {
   const asset = await raw(assetMatch[1]);
-  check("静态资源答得上来", asset.status === 200, String(asset.status));
-  check("静态资源的类型是 JS", asset.type.includes("javascript"), asset.type);
+  checkStatic("静态资源答得上来", asset.status === 200, String(asset.status));
+  checkStatic("静态资源的类型是 JS", asset.type.includes("javascript"), asset.type);
   const rootAsset = await raw(assetMatch[1].replace("/admin", ""));
-  check("根上的那一份静态资源也答得上来", rootAsset.status === 200, String(rootAsset.status));
+  checkStatic("根上的那一份静态资源也答得上来", rootAsset.status === 200, String(rootAsset.status));
 }
 
 const missingAsset = await raw("/admin/assets/does-not-exist.js");
@@ -767,7 +776,7 @@ check(
   `${missingAsset.status} ${missingAsset.type}`,
 );
 const missingRoute = await raw("/admin/does-not-exist-page");
-check(
+checkStatic(
   "不存在的深链接回 index.html",
   missingRoute.status === 200 && missingRoute.type.includes("text/html"),
   `${missingRoute.status} ${missingRoute.type}`,
@@ -775,10 +784,11 @@ check(
 
 const postDeep = await fetch(`${base}/admin/config`, { method: "POST" });
 check("深链接不接受 POST", postDeep.status === 404, String(postDeep.status));
-check("深链接的 404 是 JSON", (postDeep.headers.get("content-type") ?? "").includes("json"), postDeep.headers.get("content-type") ?? "");
+checkStatic("深链接的 404 是 JSON", (postDeep.headers.get("content-type") ?? "").includes("json"), postDeep.headers.get("content-type") ?? "");
 
 const traversal = await rawSocket("GET /admin/../../etc/passwd HTTP/1.1");
-check("目录穿越被挡住", traversal.includes("403"), traversal.split("\r\n")[0]);
+checkStatic("目录穿越被挡住", traversal.includes("403"), traversal.split("\r\n")[0]);
+if (!HAS_DIST) console.log(`  note 没有 web/dist（先跑 web:build），跳过了 ${skippedStatic} 项静态托管检查`);
 
 /** 不让库把路径改掉：自己发一个请求。 */
 function rawSocket(request: string): Promise<string> {
@@ -803,9 +813,7 @@ console.log("");
 console.log("重启");
 
 // RestartSystem 会让进程退出去，所以另起一个网关来试。
-const restartData = "/tmp/opencode/test-admin-contract-restart";
-fs.rmSync(restartData, { recursive: true, force: true });
-fs.mkdirSync(restartData, { recursive: true, mode: 0o700 });
+const restartData = fs.mkdtempSync(path.join(os.tmpdir(), "test-admin-contract-restart-"));
 const restartRouter = await startHarness({
   dataDir: restartData,
   // 这个目录本来就是临时的：helper 收尾的时候一起删掉。
@@ -1007,6 +1015,10 @@ try {
 
 console.log("");
 console.log(`pass=${pass} fail=${fail}`);
+// 先关库、等网关进程退了，再删目录：Windows 上开着的库删不掉（EPERM）。
+const { closeStore } = await import("../lib/store.ts");
+closeStore();
+await router.stopAndWait();
 fs.rmSync(LOCAL_DATA_DIR, { recursive: true, force: true });
-router.stop();
+fs.rmSync(DATA_DIR, { recursive: true, force: true });
 process.exit(fail ? 1 : 0);

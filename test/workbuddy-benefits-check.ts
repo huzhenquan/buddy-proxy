@@ -11,12 +11,14 @@
 //   3. 在路上的时候说清楚什么时候回来、能拿多少。
 
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import http from "node:http";
 
-const DATA_DIR = "/tmp/opencode/test-workbuddy-benefits";
+// 临时目录走系统的 tmpdir：写死的 /tmp 在 Windows 上落到当前盘的根上，
+// 而且两次运行会撞在同一个目录上。
+const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "test-workbuddy-benefits-"));
 process.env.BUDDY_DATA_DIR = DATA_DIR;
-fs.rmSync(DATA_DIR, { recursive: true, force: true });
-fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 
 let pass = 0;
 let fail = 0;

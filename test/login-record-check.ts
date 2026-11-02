@@ -13,7 +13,7 @@ import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { startGateway } from "./harness.ts";
 
@@ -155,13 +155,15 @@ async function call(method: string, body: unknown = {}): Promise<{ status: numbe
  * ------------------------------------------------------------------ */
 
 process.env.BUDDY_DATA_DIR = DATA_DIR;
+// import() 要 URL：Windows 上 "D:\..." 这样的路径会被当成 d: 协议。
+const lib = (rel: string) => pathToFileURL(path.join(ROOT, rel)).href;
 // 这几个模块之间有循环引用，加载顺序得跟网关一样（router-proxy.ts 就是这个
 // 顺序），不然模块顶层会读到还没初始化的东西。
-await import(path.join(ROOT, "lib/config.ts"));
-await import(path.join(ROOT, "lib/store.ts"));
-await import(path.join(ROOT, "lib/platforms.ts"));
-await import(path.join(ROOT, "lib/providers.ts"));
-const { loginActivity } = await import(path.join(ROOT, "lib/admin/login.ts"));
+await import(lib("lib/config.ts"));
+await import(lib("lib/store.ts"));
+await import(lib("lib/platforms.ts"));
+await import(lib("lib/providers.ts"));
+const { loginActivity } = await import(lib("lib/admin/login.ts"));
 
 const db = new DatabaseSync(path.join(DATA_DIR, "buddy.db"));
 // The gateway writes in WAL mode; a reader that does not speak WAL sees the
@@ -274,6 +276,9 @@ check("控制组算正在登录", loginActivity(controlAccount).loggingIn === tr
 
 console.log("");
 console.log(`pass=${pass} fail=${fail}`);
-gateway.stop();
+db.close();
+const { closeStore } = await import(lib("lib/store.ts"));
+closeStore();
+await gateway.stopAndWait();
 mock.close();
 process.exit(fail ? 1 : 0);

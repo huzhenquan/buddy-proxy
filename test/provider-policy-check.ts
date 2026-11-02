@@ -8,12 +8,14 @@
 // 表里的行。所以这里改策略用 setPlatformPolicy，加减账号用 addAccount。
 
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { BenefitOutcome } from "../lib/benefits.ts";
 
-const DATA_DIR = "/tmp/opencode/test-provider-policy";
+// 临时目录走系统的 tmpdir：写死的 /tmp 在 Windows 上落到当前盘的根上，
+// 而且两次运行会撞在同一个目录上。
+const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "test-provider-policy-"));
 process.env.BUDDY_DATA_DIR = DATA_DIR;
-fs.rmSync(DATA_DIR, { recursive: true, force: true });
-fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 
 const { create } = await import("@bufbuild/protobuf");
 const { accountsOfPlatform, addAccount, listProviders, provider, updateProvider } = await import(

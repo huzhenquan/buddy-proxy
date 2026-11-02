@@ -9,11 +9,13 @@
 // 窗口）看不见；窗口见底时也说不出多久恢复；平台说账号不可用时我们照发请求。
 
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-const DATA_DIR = "/tmp/opencode/test-intern-ai-quota-view";
+// 临时目录走系统的 tmpdir：写死的 /tmp 在 Windows 上落到当前盘的根上，
+// 而且两次运行会撞在同一个目录上。
+const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "test-intern-ai-quota-view-"));
 process.env.BUDDY_DATA_DIR = DATA_DIR;
-fs.rmSync(DATA_DIR, { recursive: true, force: true });
-fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 
 const { internAiKind } = await import("../lib/intern-ai/register.ts");
 

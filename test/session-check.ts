@@ -165,16 +165,18 @@ console.log("");
 console.log("新会话到货，作废的结论也作废");
 
 {
-  const { writeSession, markCredentialRefused, credentialRefused } = await import("../lib/session.ts");
+  // lib/session.ts 里「平台拒了这份会话」的记号叫 markSessionDead / deadSession
+  // （旧名 markCredentialRefused 已经不在了）。
+  const { writeSession, markSessionDead, deadSession } = await import("../lib/session.ts");
   const id = "session:provider:test-refused";
 
   // 探测到平台拒了这个凭据。
-  markCredentialRefused(id, "上游拒绝了这个令牌");
-  check("记下了", credentialRefused(id) !== null, String(credentialRefused(id)));
+  markSessionDead(id, "上游拒绝了这个令牌");
+  check("记下了", deadSession(id) !== null, String(deadSession(id)));
 
   // 新会话到货。
   writeSession(id, { accessToken: "a1", refreshToken: "r1", generation: 1, loginAtMs: 3000 });
-  check("新会话把那个结论作废了", credentialRefused(id) === null, String(credentialRefused(id)));
+  check("新会话把那个结论作废了", deadSession(id) === null, String(deadSession(id)));
 }
 
 console.log("");
