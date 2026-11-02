@@ -1,4 +1,5 @@
 import type { Json } from "../json.ts";
+import { cachedInputOfOpenAI } from "./cache.ts";
 import { AuthError } from "../credential.ts";
 import { randomUUID } from "node:crypto";
 import { readSseEvents, sseData, sseEvent, SSE_DONE } from "../sse-stream.ts";
@@ -66,7 +67,7 @@ export async function* openaiStreamToAnthropic(
     if (chunk.usage) {
       inputTokens = chunk.usage.prompt_tokens ?? inputTokens;
       outputTokens = chunk.usage.completion_tokens ?? outputTokens;
-      cachedTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? cachedTokens;
+      cachedTokens = cachedInputOfOpenAI(chunk.usage) || cachedTokens;
       reasoningTokens = chunk.usage.completion_tokens_details?.reasoning_tokens ?? reasoningTokens;
     }
     // After the finish reason the upstream may still send the usage; anything
@@ -167,14 +168,15 @@ export async function* openaiStreamToAnthropic(
     // OpenAI dialect only knows them at the end — so they ride along here, and a
     // client that reads them from the last frame finds them.
     usage: {
-      input_tokens: inputTokens,
+      // Anthropic 的 input_tokens 只算没命中缓存的（见 dialect/cache.ts）。
+      input_tokens: Math.max(0, inputTokens - cachedTokens),
       output_tokens: outputTokens,
       ...(cachedTokens ? { cache_read_input_tokens: cachedTokens } : {}),
       ...(reasoningTokens ? { output_tokens_details: { thinking_tokens: reasoningTokens } } : {}),
     },
   });
   onUsage?.({
-    input_tokens: inputTokens,
+    input_tokens: Math.max(0, inputTokens - cachedTokens),
     output_tokens: outputTokens,
     ...(cachedTokens ? { cache_read_input_tokens: cachedTokens } : {}),
     ...(reasoningTokens ? { output_tokens_details: { thinking_tokens: reasoningTokens } } : {}),
@@ -200,6 +202,7 @@ export async function* anthropicStreamToOpenAI(
   let inputTokens = 0;
   let outputTokens = 0;
   let cachedTokens = 0;
+  let writtenTokens = 0;
 
   const chunk = (delta: Json, finishReason: string | null = null, usage?: Json) =>
     sseData({
@@ -232,6 +235,7 @@ export async function* anthropicStreamToOpenAI(
       const usage = evt.message?.usage ?? {};
       inputTokens = usage.input_tokens ?? inputTokens;
       cachedTokens = usage.cache_read_input_tokens ?? cachedTokens;
+      writtenTokens = usage.cache_creation_input_tokens ?? writtenTokens;
       if (!roleSent) {
         roleSent = true;
         yield chunk({ role: "assistant", content: "" });
@@ -295,7 +299,7 @@ export async function* anthropicStreamToOpenAI(
     }
     if (evt.type === "message_stop") {
       if (!finished) yield chunk({}, "stop");
-      const usage = openaiUsage(inputTokens, outputTokens, cachedTokens);
+      const usage = openaiUsage(inputTokens, outputTokens, cachedTokens, writtenTokens);
       onUsage?.(usage);
       yield chunk({}, null, usage);
       yield SSE_DONE;
@@ -303,19 +307,28 @@ export async function* anthropicStreamToOpenAI(
     }
   }
   if (!finished) yield chunk({}, "stop");
-  const usage = openaiUsage(inputTokens, outputTokens, cachedTokens);
+  const usage = openaiUsage(inputTokens, outputTokens, cachedTokens, writtenTokens);
   onUsage?.(usage);
   yield chunk({}, null, usage);
   yield SSE_DONE;
 }
 
 /** The usage in the OpenAI shape. */
-function openaiUsage(inputTokens: number, outputTokens: number, cachedTokens: number): Json {
+function openaiUsage(
+  inputTokens: number,
+  outputTokens: number,
+  cachedTokens: number,
+  writtenTokens = 0,
+): Json {
+  // OpenAI 的 prompt_tokens 是全部输入：Anthropic 的 input_tokens 只是没命中
+  // 缓存的那部分，命中读到的与写进去的都要算进去（见 dialect/cache.ts）。
+  const prompt = inputTokens + cachedTokens + writtenTokens;
   return {
-    prompt_tokens: inputTokens,
+    prompt_tokens: prompt,
     completion_tokens: outputTokens,
-    total_tokens: inputTokens + outputTokens,
+    total_tokens: prompt + outputTokens,
     ...(cachedTokens ? { prompt_tokens_details: { cached_tokens: cachedTokens } } : {}),
+    ...(cachedTokens ? { prompt_cache_hit_tokens: cachedTokens } : {}),
   };
 }
 

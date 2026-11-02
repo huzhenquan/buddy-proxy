@@ -86,6 +86,70 @@ check("the model's own temperature is sent when the caller has none", defaults.t
 check("the model's own top_p is sent when the caller has none", defaults.top_p === 1);
 
 console.log("");
+console.log("the identity of the caller");
+
+// The upstream's channel check reads the opening line of the system prompt and
+// refuses the request when it names a client that is not theirs (code 11128).
+const foreign = "You are Claude Code, Anthropic's official CLI for Claude.";
+const systemOf = (b: any): string => String(b.messages[0]?.content ?? "");
+
+const rewritten = buildChatBody(
+  { model: "hy3", messages: [{ role: "system", content: `${foreign}\n\nThe rest of the prompt.` }, { role: "user", content: "hi" }] },
+  model,
+);
+check("the foreign opening line is gone", !systemOf(rewritten).startsWith(foreign), systemOf(rewritten).slice(0, 80));
+check("no half sentence is left behind", !systemOf(rewritten).includes("Anthropic's official CLI"), systemOf(rewritten).slice(0, 80));
+check("the rest of the prompt is kept", systemOf(rewritten).includes("The rest of the prompt."));
+check("the simulated client's own line is used", systemOf(rewritten).startsWith("You are a helpful assistant."), systemOf(rewritten).slice(0, 40));
+
+const lowercase = buildChatBody(
+  { model: "hy3", messages: [{ role: "system", content: foreign.toLowerCase() }, { role: "user", content: "hi" }] },
+  model,
+);
+check("the check does not care about the case", !systemOf(lowercase).toLowerCase().includes("claude code"), systemOf(lowercase));
+
+// The upstream counts leading spaces as the opening too (measured).
+const spaced = buildChatBody(
+  { model: "hy3", messages: [{ role: "system", content: `  ${foreign}` }, { role: "user", content: "hi" }] },
+  model,
+);
+check("leading spaces do not hide the opening", !systemOf(spaced).toLowerCase().includes("claude code"), systemOf(spaced));
+
+const inside = buildChatBody(
+  { model: "hy3", messages: [{ role: "system", content: `You are a helpful assistant.\n${foreign}` }, { role: "user", content: "hi" }] },
+  model,
+);
+check("a line that is not the opening one is left alone", systemOf(inside).includes(foreign), systemOf(inside));
+
+const plain = buildChatBody(
+  { model: "hy3", messages: [{ role: "system", content: "You are a helpful assistant." }, { role: "user", content: "hi" }] },
+  model,
+);
+check("an ordinary system prompt is untouched", systemOf(plain) === "You are a helpful assistant.", systemOf(plain));
+
+const inUser = buildChatBody(
+  { model: "hy3", messages: [{ role: "user", content: foreign }] },
+  model,
+);
+check("the line in a user message is left alone", String(inUser.messages[1]?.content) === foreign);
+
+// The system prompt in parts (the OpenAI dialect's content array): the opening
+// is the first part.
+const inParts = buildChatBody(
+  { model: "hy3", messages: [{ role: "system", content: [{ type: "text", text: foreign }, { type: "text", text: "more" }] }, { role: "user", content: "hi" }] },
+  model,
+);
+const parts = inParts.messages[0]?.content as Array<{ text?: string }>;
+check("the first part of a system prompt in parts is rewritten", !String(parts?.[0]?.text ?? "").toLowerCase().includes("claude code"), String(parts?.[0]?.text));
+check("the other parts are kept", String(parts?.[1]?.text ?? "") === "more", String(parts?.[1]?.text));
+
+// The caller's body must not be touched: the same body goes to the other
+// upstreams of a published model, one after the other.
+const shared = { model: "hy3", messages: [{ role: "system", content: foreign }, { role: "user", content: "hi" }] };
+buildChatBody(shared, model);
+check("the caller's body is not rewritten", String((shared.messages[0] as any).content) === foreign, String((shared.messages[0] as any).content));
+
+console.log("");
 console.log("the conversation id");
 
 const messages = [

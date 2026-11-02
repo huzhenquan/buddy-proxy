@@ -15,11 +15,17 @@
 //     back into a single chat.completion object here.
 //   * A failure can arrive as HTTP 200 with an error object in the body. The
 //     gateway has to look, or the agent sees an empty answer.
+//
+// And one that keeps the request alive: the upstream's channel check reads the
+// opening line of the system prompt and refuses a request that names another
+// client (see lib/workbuddy/identity.ts).
 
 import type { Json } from "../json.ts";
 import { createHash } from "node:crypto";
 import { AuthError } from "../credential.ts";
-import { withCooldownUntil, withUpstreamStatus, retryAfterMs } from "../upstream-status.ts";
+import { withCooldownUntil, withUpstreamStatus, withBusinessCode, retryAfterMs } from "../upstream-status.ts";
+import { DEFAULT_SYSTEM, rewriteSystemContent } from "./identity.ts";
+import { businessCodeOfBody, logCredentialRejection, logUpstreamBody, logUpstreamPayload } from "./upstream-log.ts";
 import {
   chatBase,
   chatHeaders,
@@ -62,9 +68,18 @@ export function buildChatBody(
   model?: WorkBuddyModel | null,
 ): Json {
   const out: Json = { ...body };
-  const messages = Array.isArray(out.messages) ? out.messages : [];
+  // 数组是复制出来的：同一个 body 会依次交给好几个上游（主路由模型可以有
+  // 多个目标），就地改了会把这一处的改写漏给下一个上游。
+  const messages: Json[] = Array.isArray(out.messages) ? [...(out.messages as Json[])] : [];
   if (!messages.length || messages[0]?.role !== "system") {
-    out.messages = [{ role: "system", content: "You are a helpful assistant." }, ...messages];
+    out.messages = [{ role: "system", content: DEFAULT_SYSTEM }, ...messages];
+  } else {
+    // 上游的渠道校验认的是系统提示词开头那句自报家门（见 identity.ts）。
+    const head = messages[0];
+    if (head && typeof head === "object") {
+      messages[0] = { ...(head as object), content: rewriteSystemContent((head as { content?: unknown }).content) };
+    }
+    out.messages = messages;
   }
   out.stream = true;
   if (!out.stream_options) out.stream_options = { include_usage: true };
@@ -192,6 +207,7 @@ export async function workbuddyChat(
 
   const payload = buildChatBody(body, opts.model ?? null);
   const url = `${chatBase(session)}${CHAT_PATH}`;
+  logUpstreamPayload(payload);
 
   for (let attempt = 1; ; attempt++) {
     const headers = chatHeaders(session, { conversationId: opts.conversationId });
@@ -217,6 +233,8 @@ export async function workbuddyChat(
 
     if (res.status === 401 || res.status === 403) {
       const detail = await res.text().catch(() => "");
+      // 正文里可能有账号标识，不进 stdout；走凭据日志（数据卷里的 auth.log）。
+      logCredentialRejection(res.status);
       // 平台拒了这个令牌：这里不换令牌（换令牌是定时器的事，它临期就换）。
       // 换个说法报出去。
       throw withUpstreamStatus(
@@ -244,6 +262,7 @@ export async function workbuddyChat(
         ),
         res.status,
       );
+      logUpstreamBody(res.status, detail);
       // 上游说的「过多久再试」：冷却到那时候为止（路由层看这个，不自己猜）。
       const wait = retryAfterMs(res);
       if (wait !== null) withCooldownUntil(error, Date.now() + wait);
@@ -252,10 +271,11 @@ export async function workbuddyChat(
 
     if (res.status >= 400) {
       const detail = await res.text().catch(() => "");
+      logUpstreamBody(res.status, detail);
       // The client sees the gateway's status; the upstream's own status says
       // whether another account would do better (a 400 is the request's fault,
       // and every account would fail the same way).
-      throw withUpstreamStatus(
+      const error = withUpstreamStatus(
         new AuthError(
           `upstream error (HTTP ${res.status})`,
           detail.slice(0, 300) || `WorkBuddy 返回了 HTTP ${res.status}`,
@@ -263,6 +283,10 @@ export async function workbuddyChat(
         ),
         res.status,
       );
+      // 渠道校验是 11128，日志里要能一眼看出是风控，不是参数写错。
+      const code = businessCodeOfBody(detail);
+      if (code !== null) withBusinessCode(error, code);
+      throw error;
     }
 
     return { response: res, session };
