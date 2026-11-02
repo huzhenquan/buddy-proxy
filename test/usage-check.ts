@@ -291,9 +291,10 @@ const bySession = usageSummary("", "");
 const sessionKeys = bySession.bySession.map((b) => b.key).sort();
 check(
   "按会话分组：每个会话各一份",
+  // 分桶的 key 是显示名（agent 名 · 短 id，lib/admin/usage.ts sessionLabel），不是裸 id。
   sessionKeys.length === 3 &&
-    sessionKeys.includes("ses-1") &&
-    sessionKeys.includes("ses-child") &&
+    sessionKeys.includes("be-match · 1") &&
+    sessionKeys.includes("reviewer · child") &&
     sessionKeys.includes("未知"),
   JSON.stringify(sessionKeys),
 );
@@ -301,10 +302,10 @@ check(
 const parentKeys = bySession.byParentSession.map((b) => b.key).sort();
 check(
   "按主会话分组：子代理的并进主代理那一档",
-  parentKeys.length === 2 && parentKeys.includes("ses-parent") && parentKeys.includes("未知"),
+  parentKeys.length === 2 && parentKeys.includes("be-match · parent") && parentKeys.includes("未知"),
   JSON.stringify(parentKeys),
 );
-const mainBucket = bySession.byParentSession.find((b) => b.key === "ses-parent");
+const mainBucket = bySession.byParentSession.find((b) => b.key === "be-match · parent");
 // ses-1 与 ses-child 都是 ses-parent 名下的（ses-child 的父是 ses-1，
 // ses-1 的父是 ses-parent）—— 溯源之后都算 ses-parent 那一档。
 const inChain = listUsage().filter(
@@ -354,6 +355,10 @@ check(
   JSON.stringify(bySubagent),
 );
 
+// Close the database before removing its directory: on Windows an open
+// file cannot be deleted (EPERM), so the handle has to go first.
+const { closeStore } = await import("../lib/store.ts");
+closeStore();
 fs.rmSync(tmp, { recursive: true, force: true });
 
 console.log("");

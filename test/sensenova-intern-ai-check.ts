@@ -14,14 +14,17 @@
 //      积分用完了是 OUT_OF_CREDITS。
 
 import fs from "node:fs";
+import os from "node:os";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { startGateway as startHarness } from "./harness.ts";
 
-const DATA_DIR = "/tmp/opencode/test-sensenova-intern-ai";
-const UNIT_DIR = "/tmp/opencode/test-sensenova-intern-ai-unit";
+// 临时目录走系统的 tmpdir：写死的 /tmp 在 Windows 上落到当前盘的根上，
+// 而且两次运行会撞在同一个目录上。
+const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "test-sensenova-intern-ai-"));
+const UNIT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "test-sensenova-intern-ai-unit-"));
 const SERVICE = "/buddy.admin.v1.AdminService";
 
 let pass = 0;
@@ -49,8 +52,6 @@ function section(title: string): void {
  * ------------------------------------------------------------------ */
 
 // 单元部分用自己的数据目录，免得跟网关抢一个库。
-fs.rmSync(UNIT_DIR, { recursive: true, force: true });
-fs.mkdirSync(UNIT_DIR, { recursive: true, mode: 0o700 });
 process.env.BUDDY_DATA_DIR = UNIT_DIR;
 
 const { senseNovaCatalogModels, internAiCatalogModels } = await import("../lib/router/catalog.ts");
@@ -448,8 +449,6 @@ const fakeBase = `http://127.0.0.1:${(fake.address() as net.AddressInfo).port}`;
  * 三、网关
  * ------------------------------------------------------------------ */
 
-fs.rmSync(DATA_DIR, { recursive: true, force: true });
-fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 
 // 起网关交给共用的 helper：端口被抢就换号重试，失败一定收尾。
 const gw = await startHarness({

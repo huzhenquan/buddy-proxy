@@ -16,7 +16,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -428,13 +428,14 @@ for (const key of ["REQUIRE_API_KEY", "ADMIN_CORS_ORIGINS", "USAGE_RETENTION_DAY
 
 section("环境里的上游开关");
 
+// 子进程里的 import() 要 file:// URL：Windows 上裸的 "D:\..." 会被当成 d: 协议。
 // 一个新的进程：环境变量在那时候还在，而上游的开关已经只认数据库了。
 const ENV_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "cleanup-admin-env-"));
 const envRun = spawnSync(
   process.execPath,
   ["--experimental-strip-types", "-e", `
-    const { listProviders } = await import("${ROOT}/lib/providers.ts");
-    const { PLATFORMS } = await import("${ROOT}/lib/platforms.ts");
+    const { listProviders } = await import("${pathToFileURL(path.join(ROOT, "lib/providers.ts")).href}");
+    const { PLATFORMS } = await import("${pathToFileURL(path.join(ROOT, "lib/platforms.ts")).href}");
     // 环境里那几个开关还在，但没人读了：一个账号都不该冒出来。
     const rows = listProviders();
     console.log(JSON.stringify({ platforms: PLATFORMS.length, rows: rows.map((r) => [r.id, r.enabled]) }));
@@ -463,6 +464,10 @@ fs.rmSync(ENV_DIR, { recursive: true, force: true });
  * 结果
  * ------------------------------------------------------------------ */
 
+// Close the database before removing its directory: on Windows an open
+// file cannot be deleted (EPERM), so the handle has to go first.
+const { closeStore } = await import("../lib/store.ts");
+closeStore();
 fs.rmSync(DATA_DIR, { recursive: true, force: true });
 
 console.log("");

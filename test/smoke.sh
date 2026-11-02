@@ -16,7 +16,6 @@ cd "$ROOT"
 # numbers that are not there any more. The gateway now makes its own temporary
 # one (test/serve.ts), so there is nothing here to clean up.
 FIXTURES="$ROOT/test/fixtures"
-mkdir -p /tmp/opencode
 
 if [ ! -d "$FIXTURES" ] || [ -z "$(ls -A "$FIXTURES" 2>/dev/null)" ]; then
   echo "no fixtures yet — run test/capture.sh first"
@@ -44,7 +43,13 @@ mkdir -p "$LOG_DIR"
 
 # 网关与假上游都交给 test/serve.ts 起：端口由共享 helper 挑（撞了就换号重来），
 # 起来之后它把基址写进 ready 文件；收尾时它自己把网关与假上游都收掉。
-READY="$(mktemp -d)/ready.json"
+#
+# The ready file sits under the log directory for the same reason as the logs:
+# `mktemp -d` answers "/tmp/...", which bash maps to %TEMP% but Node (with
+# MSYS path conversion off) maps to the root of the current drive, so the two
+# would never see the same file.
+READY="$LOG_DIR/ready.json"
+rm -f "$READY"
 node --experimental-strip-types test/serve.ts --mock --ready-file "$READY" \
   --env "TEST_UPSTREAMS=$TEST_UPSTREAMS" \
   --log-file "$LOG_DIR/smoke-router.log" > "$LOG_DIR/smoke-serve.log" 2>&1 &

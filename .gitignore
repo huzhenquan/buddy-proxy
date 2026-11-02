@@ -32,3 +32,5 @@ mise.local.toml
 # Python
 __pycache__/
 *.pyc
+test/.smoke-logs/
+test/.tmp/

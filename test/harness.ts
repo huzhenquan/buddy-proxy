@@ -81,6 +81,11 @@ export interface Gateway {
   log(): string;
   /** 幂等：SIGTERM → 500ms → SIGKILL，并删掉临时数据目录（只有 helper 自己建的才删）。 */
   stop(): void;
+  /**
+   * 同 stop()，但等子进程真的退了才返回。调用方自己删数据目录之前用它：
+   * Windows 上子进程还开着 SQLite 时目录删不掉（EPERM）。
+   */
+  stopAndWait(): Promise<void>;
 }
 
 interface GatewayState {
@@ -560,6 +565,10 @@ export async function startGateway(options: GatewayOptions = {}): Promise<Gatewa
         dataDir,
         log: () => output.text,
         stop: () => stopGateway(state),
+        stopAndWait: async () => {
+          stopGateway(state);
+          await terminate(child);
+        },
       };
     }
 

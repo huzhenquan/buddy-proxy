@@ -7,12 +7,15 @@
 // 还是不是公开的。
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { startGateway as startHarness, type Gateway } from "./harness.ts";
 import { tokenPlanView } from "../lib/admin/upstreams.ts";
 
-const DATA_DIR = "/tmp/opencode/test-admin-check";
+// 临时目录走系统的 tmpdir：写死的 /tmp 在 Windows 上落到当前盘的根上，
+// 而且两次运行会撞在同一个目录上。
+const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "test-admin-check-"));
 const SERVICE = "/buddy.admin.v1.AdminService";
 
 let pass = 0;
@@ -103,8 +106,6 @@ async function startRouter(): Promise<Gateway> {
 
 // 上一次跑留下的库会让「改完要重启才生效」这类断言失去意义：启动时读到的
 // 就是上次的值，没什么可改。所以每次都从空的目录开始。
-fs.rmSync(DATA_DIR, { recursive: true, force: true });
-fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 
 router = await startRouter();
 
@@ -119,7 +120,8 @@ console.log("令牌");
 const tokenFile = path.join(DATA_DIR, "admin-token");
 check("令牌文件生成了", fs.existsSync(tokenFile));
 const mode = fs.existsSync(tokenFile) ? fs.statSync(tokenFile).mode & 0o777 : 0;
-check("令牌文件是 0600", mode === 0o600, `0${mode.toString(8)}`);
+// Windows 没有 POSIX 权限位：stat 出来总是 0666，这一项只在类 Unix 上有意义。
+if (process.platform !== "win32") check("令牌文件是 0600", mode === 0o600, `0${mode.toString(8)}`);
 const token = fs.existsSync(tokenFile) ? fs.readFileSync(tokenFile, "utf8").trim() : "";
 
 // 第一次起来的时候，日志里要看得见完整的令牌：人不在机器前，这是唯一的

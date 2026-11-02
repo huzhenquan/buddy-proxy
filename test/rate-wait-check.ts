@@ -368,7 +368,13 @@ section("算法：等多久（单元）");
   check("RPM → 不等（null）", rateLimitWaitMs(rpm) === null, String(rateLimitWaitMs(rpm)));
 }
 
+// 等网关进程真的退了再删它的目录：Windows 上它开着的库删不掉（EPERM）。
+await gw.stopAndWait();
 cleanup();
+// Close the database before removing its directory: on Windows an open
+// file cannot be deleted (EPERM), so the handle has to go first.
+const { closeStore } = await import("../lib/store.ts");
+closeStore();
 fs.rmSync(DATA_DIR, { recursive: true, force: true });
 
 console.log("");

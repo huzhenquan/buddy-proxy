@@ -184,6 +184,8 @@ interface Gateway {
   token: string;
   log: () => string;
   stop: () => void;
+  /** 等网关进程真的退了：之后才能删它的数据目录（Windows 上开着的库删不掉）。 */
+  stopAndWait: () => Promise<void>;
   accounts: string[];
   dataDir: string;
 }
@@ -229,6 +231,7 @@ async function startGateway(dataDir?: string): Promise<Gateway> {
     token,
     log: () => running.log(),
     stop: () => running.stop(),
+    stopAndWait: () => running.stopAndWait(),
     accounts: [],
     dataDir: dir,
   };
@@ -348,6 +351,22 @@ function writeCooldown(dataDir: string, providerId: string, untilMs: number, rea
   }
 }
 
+/**
+ * 等冷却那一行消失。
+ *
+ * 清冷却发生在答复交付**之后**（结算只认「流真的结束了」），而客户端看到
+ * message_stop 的那一刻，网关可能还在收尾。所以这里给一小段窗口，不能立刻断言：
+ * 在慢一点的机器上（CI）那就是一条假红。真出问题（永远不清）照样会超时失败。
+ */
+async function waitForCooldownGone(dataDir: string, providerId: string, ms = 3000): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    if (cooldownRow(dataDir, providerId) === null) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
 /* ------------------------------------------------------------------ *
  * 场景
  * ------------------------------------------------------------------ */
@@ -396,7 +415,7 @@ console.log("场景一：限流 —— 换到下一个账号，冷却到「重�
       gw.log().slice(-600),
     );
   } finally {
-    gw.stop();
+    await gw.stopAndWait();
     fs.rmSync(gw.dataDir, { recursive: true, force: true });
   }
 }
@@ -426,7 +445,7 @@ console.log("场景二：账号级失败（凭据被拒）—— 固定的 5 分
     );
     check("理由是凭据被拒", row?.reason === "credential", String(row?.reason));
   } finally {
-    gw.stop();
+    await gw.stopAndWait();
     fs.rmSync(gw.dataDir, { recursive: true, force: true });
   }
 }
@@ -448,7 +467,7 @@ console.log("场景三：成功一次，冷却就没了");
     check("用的是第一个账号", calls.join(",") === "1", calls.join(","));
     check("冷却那一行没了", cooldownRow(gw.dataDir, gw.accounts[0]) === null, "还在");
   } finally {
-    gw.stop();
+    await gw.stopAndWait();
     fs.rmSync(gw.dataDir, { recursive: true, force: true });
   }
 }
@@ -473,7 +492,7 @@ console.log("场景四：冷却落库 —— 重启以后还在");
       "库里没有那一行",
     );
   } finally {
-    gw.stop();
+    await gw.stopAndWait();
   }
 
   // 重启：同一个数据目录，另一个进程。
@@ -488,7 +507,7 @@ console.log("场景四：冷却落库 —— 重启以后还在");
       calls.join(","),
     );
   } finally {
-    again.stop();
+    await again.stopAndWait();
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 }
@@ -511,7 +530,7 @@ console.log("场景五：单一策略 —— 冷却的时候直接说，不去�
     check("提示里说了到什么时候", answered.text.includes("恢复"), answered.text.slice(0, 300));
     check("没有去打上游", calls.length === 0, calls.join(","));
   } finally {
-    gw.stop();
+    await gw.stopAndWait();
     fs.rmSync(gw.dataDir, { recursive: true, force: true });
   }
 }
@@ -537,7 +556,7 @@ console.log("场景六：流式答复 —— 流完了才算成功，中途断�
     );
     check(
       "流正常结束：冷却那一行没了",
-      cooldownRow(gw.dataDir, gw.accounts[0]) === null,
+      await waitForCooldownGone(gw.dataDir, gw.accounts[0]),
       "还在",
     );
 
@@ -546,11 +565,11 @@ console.log("场景六：流式答复 —— 流完了才算成功，中途断�
     const plain = await chat(gw);
     check(
       "非流式：成功还是清掉冷却",
-      plain.status === 200 && cooldownRow(gw.dataDir, gw.accounts[0]) === null,
+      plain.status === 200 && (await waitForCooldownGone(gw.dataDir, gw.accounts[0])),
       `${plain.status} ${plain.text.slice(0, 200)}`,
     );
   } finally {
-    gw.stop();
+    await gw.stopAndWait();
     fs.rmSync(gw.dataDir, { recursive: true, force: true });
   }
 }
@@ -583,7 +602,7 @@ console.log("场景六：流式答复 —— 流完了才算成功，中途断�
       gw.log().slice(-600),
     );
   } finally {
-    gw.stop();
+    await gw.stopAndWait();
     fs.rmSync(gw.dataDir, { recursive: true, force: true });
   }
 }
@@ -767,6 +786,10 @@ console.log("算法：限流是分钟级的 —— 冷却一分钟，不是一�
 }
 
 upstream.close();
+// Close the database before removing its directory: on Windows an open
+// file cannot be deleted (EPERM), so the handle has to go first.
+const { closeStore } = await import("../lib/store.ts");
+closeStore();
 fs.rmSync(UNIT_DIR, { recursive: true, force: true });
 
 console.log("");

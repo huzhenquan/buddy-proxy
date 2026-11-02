@@ -16,8 +16,14 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-export BUDDY_DATA_DIR="${BUDDY_DATA_DIR:-/tmp/opencode/test-aggregate}"
-mkdir -p /tmp/opencode
+# Paths relative to the repository root: bash and Node resolve "/tmp" to
+# different places on Windows (see test/smoke.sh).
+LOG_DIR="test/.tmp/aggregate"
+mkdir -p "$LOG_DIR"
+# The database is always a fresh directory of the test's own, whatever the
+# shell exported: the run removes it, and a developer's BUDDY_DATA_DIR may point
+# at the real one.
+export BUDDY_DATA_DIR="$(mktemp -d "$LOG_DIR/data.XXXXXX")"
 PASS=0
 FAIL=0
 
@@ -32,8 +38,6 @@ check() {
   fi
 }
 
-rm -rf "$BUDDY_DATA_DIR"
-mkdir -p "$BUDDY_DATA_DIR"
 
 # The sessions of the two upstreams the requests need go into the test's own
 # database. The mock upstream does not look at the credential, but the router
@@ -43,14 +47,16 @@ mkdir -p "$BUDDY_DATA_DIR"
 node --experimental-strip-types test/aggregate-setup.ts seed
 
 # 网关与假上游交给 test/serve.ts（端口由共享 helper 挑，撞了换号重来）。
-READY="$(mktemp -d)/ready.json"
+READY="$LOG_DIR/ready.json"
+rm -f "$READY"
 node --experimental-strip-types test/serve.ts --mock --data-dir "$BUDDY_DATA_DIR" \
-  --ready-file "$READY" > /tmp/opencode/aggregate-serve.log 2>&1 &
+  --ready-file "$READY" > $LOG_DIR/aggregate-serve.log 2>&1 &
 ROUTER_PID=$!
 
 cleanup() {
   kill $ROUTER_PID 2>/dev/null
   wait $ROUTER_PID 2>/dev/null
+  rm -rf "$BUDDY_DATA_DIR"
 }
 trap cleanup EXIT
 
@@ -64,7 +70,7 @@ BASE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["base"])
 TOKEN="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["token"])' "$READY" 2>/dev/null)"
 if [ -z "$BASE" ]; then
   echo "the router did not start:"
-  tail -20 /tmp/opencode/aggregate-serve.log
+  tail -20 $LOG_DIR/aggregate-serve.log
   exit 1
 fi
 ADMIN="$BASE/buddy.admin.v1.AdminService"
@@ -82,17 +88,17 @@ echo ""
 echo "the aggregate catalog"
 
 # With nothing configured the root route has nothing to publish.
-code=$(curl -s -o /tmp/opencode/aggregate-empty.json -w '%{http_code}' "$BASE/v1/models")
+code=$(curl -s -o $LOG_DIR/aggregate-empty.json -w '%{http_code}' "$BASE/v1/models")
 [ "$code" = "404" ] && check "the empty database publishes nothing" 1 || check "the empty database publishes nothing" 0
 
 # And a model that is not published is not served.
-code=$(curl -s -o /tmp/opencode/aggregate-unknown.json -w '%{http_code}' \
+code=$(curl -s -o $LOG_DIR/aggregate-unknown.json -w '%{http_code}' \
   -X POST "$BASE/v1/chat/completions" -H 'content-type: application/json' \
   -d '{"model":"qoder/glm-5.3","messages":[{"role":"user","content":"hi"}]}')
 [ "$code" = "404" ] && check "an unpublished model is refused" 1 || check "an unpublished model is refused" 0
 
 # The upstream's own path still works, the way it always did.
-code=$(curl -s -o /tmp/opencode/aggregate-auto.json -w '%{http_code}' \
+code=$(curl -s -o $LOG_DIR/aggregate-auto.json -w '%{http_code}' \
   -X POST "$BASE/qoder/v1/chat/completions" -H 'content-type: application/json' \
   -d '{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}]}')
 [ "$code" = "200" ] && check "an upstream's own path still answers" 1 || check "an upstream's own path still answers" 0
@@ -110,7 +116,7 @@ count=$(curl -fsS "$BASE/v1/models" | python3 -c 'import json,sys; print(len(jso
 name=$(curl -fsS "$BASE/v1/models" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')
 [ "$name" = "smart" ] && check "the published model has the panel's name" 1 || check "the published model has the panel's name" 0
 
-code=$(curl -s -o /tmp/opencode/aggregate-smart.json -w '%{http_code}' \
+code=$(curl -s -o $LOG_DIR/aggregate-smart.json -w '%{http_code}' \
   -X POST "$BASE/v1/chat/completions" -H 'content-type: application/json' \
   -d '{"model":"smart","messages":[{"role":"user","content":"hi"}]}')
 [ "$code" = "200" ] && check "the published model answers" 1 || check "the published model answers" 0
@@ -120,7 +126,7 @@ echo "the fallback"
 
 # The first target has no fixture in the mock, so it fails; the second answers.
 node --experimental-strip-types test/aggregate-setup.ts clear-usage > /dev/null
-code=$(curl -s -o /tmp/opencode/aggregate-fallback.json -w '%{http_code}' \
+code=$(curl -s -o $LOG_DIR/aggregate-fallback.json -w '%{http_code}' \
   -X POST "$BASE/v1/chat/completions" -H 'content-type: application/json' \
   -d '{"model":"smart","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","description":"d","parameters":{"type":"object","properties":{}}}}]}')
 [ "$code" = "200" ] && check "the second target answers" 1 || check "the second target answers" 0

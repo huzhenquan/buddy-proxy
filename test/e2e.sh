@@ -71,7 +71,11 @@ print("ok" if data and not bad else "bad: " + ", ".join(map(str, bad[:3])))
 done
 
 # One request per upstream and dialect.
-BODY_FILE="$(mktemp)"
+# Relative to the repository root, not mktemp's "/tmp/...": with MSYS path
+# conversion off, curl (a native program) and bash put "/tmp" in different
+# places on Windows, and the body curl wrote is not the one cat reads.
+mkdir -p test/.tmp
+BODY_FILE="test/.tmp/e2e-body.$$"
 trap 'rm -f "$BODY_FILE"' EXIT
 
 for spec in "qoder:glm-5.3" "qoder-cn:glm-5.3" "workbuddy-cn:hy3" "minimax:MiniMax-M3.1-Flash" "tokenrhythm:deepseek-v4.1-flash-1017"; do

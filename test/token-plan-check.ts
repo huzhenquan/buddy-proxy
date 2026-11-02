@@ -143,6 +143,10 @@ const withoutGeneral = {
 putHealthSnapshot(withoutGeneral);
 check("只剩视频窗口就没有恢复时间", planWindowEndsAt("minimax", now) === null, String(planWindowEndsAt("minimax", now)));
 
+// Close the database before removing its directory: on Windows an open
+// file cannot be deleted (EPERM), so the handle has to go first.
+const { closeStore } = await import("../lib/store.ts");
+closeStore();
 fs.rmSync(tmp, { recursive: true, force: true });
 
 console.log("");
