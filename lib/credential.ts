@@ -22,8 +22,15 @@ export const DEFAULT_REGION = "cn";
  * logs` does not. Credential trouble is exactly the thing you want to be able to
  * read after the fact: a refresh that returns a token the gateway then rejects
  * leaves no trace in the container log once the container is replaced.
+ *
+ * `toStdout` is false for the lines whose detail carries something identifying
+ * (an upstream's rejection body can name the account, and the account id says
+ * which one it was). The detail still goes into the file — that is where it is
+ * meant to be read — but stdout is the container log, which is copied around and
+ * thrown away; it must not carry it. So the identifying part goes into the
+ * detail, not into the event: with `toStdout: false` only the event is echoed.
  */
-export function authLog(dir: string, event: string, detail = ""): void {
+export function authLog(dir: string, event: string, detail = "", options: { toStdout?: boolean } = {}): void {
   const line = `${new Date().toISOString()} ${event}${detail ? " " + detail : ""}`;
   try {
     fs.mkdirSync(dir, { recursive: true });
@@ -31,7 +38,8 @@ export function authLog(dir: string, event: string, detail = ""): void {
   } catch {
     /* logging must never break a request */
   }
-  console.log(`[AUTH] ${event}${detail ? " " + detail : ""}`);
+  const shown = options.toStdout === false ? event : `${event}${detail ? " " + detail : ""}`;
+  console.log(`[AUTH] ${shown}`);
 }
 
 /** A token is a secret; logs only ever carry its first few characters. */

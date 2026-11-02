@@ -46,18 +46,33 @@ export async function toWorkBuddy(
   const conversationId = conversationIdFor(openaiBody.messages, openaiBody.conversation_id);
   // 流式答复是在 underPolicy 返回之后才消费的：冷却由调用方在流结束时结算。
   const settle = settlement();
-  const { response } = await underPolicy(
-    route.platform,
-    "workbuddy",
-    (account) =>
-      workbuddyChat(openaiBody, {
-        providerId: account.id,
-        stream,
-        conversationId,
-        model: ctx.workbuddyModel(model),
-      }),
-    settle,
-  );
+  // 客户端走了就把上游停掉：上游还在算就是在计费，账号还占着。
+  //
+  // 非流式那条路尤其要紧：答复要等整个上游的流读完才发出去，客户端在这
+  // 中间走了（超时、按了取消），没人停上游的话它就接着算到超时（2026-11-03，
+  // 作者复查发现）。
+  const abort = new AbortController();
+  const onClientGone = () => abort.abort();
+  out.res.once("close", onClientGone);
+  let response: Response;
+  try {
+    const upstream = await underPolicy(
+      route.platform,
+      "workbuddy",
+      (account) =>
+        workbuddyChat(openaiBody, {
+          providerId: account.id,
+          stream,
+          conversationId,
+          model: ctx.workbuddyModel(model),
+          signal: abort.signal,
+        }),
+      settle,
+    );
+    response = upstream.response;
+  } finally {
+    out.res.off("close", onClientGone);
+  }
 
   if (!stream) {
     // The upstream always answers with a stream, so a non-streaming request is

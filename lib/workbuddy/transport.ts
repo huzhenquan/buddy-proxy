@@ -25,7 +25,10 @@ import { createHash } from "node:crypto";
 import { AuthError } from "../credential.ts";
 import { withCooldownUntil, withUpstreamStatus, withBusinessCode, retryAfterMs } from "../upstream-status.ts";
 import { DEFAULT_SYSTEM, rewriteSystemContent } from "./identity.ts";
-import { businessCodeOfBody, logCredentialRejection, logUpstreamBody, logUpstreamPayload } from "./upstream-log.ts";
+import { logCredentialRejection, logUpstreamBody, logUpstreamPayload } from "./upstream-log.ts";
+import { businessCodeOfBody } from "../upstream-status.ts";
+import { businessCodeOfPayload, isBusinessErrorEnvelope } from "../upstream-status.ts";
+import { ClientGoneError } from "../router/deliver.ts";
 import {
   chatBase,
   chatHeaders,
@@ -48,6 +51,12 @@ export interface WorkBuddyChatOptions {
   conversationId?: string;
   /** The model, so the body can be built the way the simulated client builds it. */
   model?: WorkBuddyModel | null;
+  /**
+   * The client gave up: stop asking the upstream.
+   *
+   * 上游还在算就是在计费，账号还占着。客户端都不要答复了，接着算就是白花钱。
+   */
+  signal?: AbortSignal;
 }
 
 export interface WorkBuddyChat {
@@ -217,9 +226,14 @@ export async function workbuddyChat(
         method: "POST",
         headers,
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(TIMEOUT_MS),
+        // 客户端走了就把这一条也停掉：上游还在算就是在计费。
+        signal: opts.signal
+          ? AbortSignal.any([opts.signal, AbortSignal.timeout(TIMEOUT_MS)])
+          : AbortSignal.timeout(TIMEOUT_MS),
       });
     } catch (e) {
+      // 客户端走了：这不是上游的错，别再试、也别记成账号的错。
+      if (opts.signal?.aborted) throw new ClientGoneError();
       if (attempt < MAX_ATTEMPTS) {
         await backoff(attempt);
         continue;
@@ -234,7 +248,7 @@ export async function workbuddyChat(
     if (res.status === 401 || res.status === 403) {
       const detail = await res.text().catch(() => "");
       // 正文里可能有账号标识，不进 stdout；走凭据日志（数据卷里的 auth.log）。
-      logCredentialRejection(res.status);
+      logCredentialRejection(res.status, providerId, detail);
       // 平台拒了这个令牌：这里不换令牌（换令牌是定时器的事，它临期就换）。
       // 换个说法报出去。
       throw withUpstreamStatus(
@@ -369,6 +383,17 @@ export async function aggregateStream(response: Response, model: string): Promis
           `upstream error (${error.code ?? error.type ?? "unknown"})`,
           typeof error.message === "string" ? error.message : JSON.stringify(error).slice(0, 300),
           502,
+        );
+      }
+      // 上游有时用 200 回一个错（WorkBuddy 的渠道校验就是）：正文里只有业务
+      // 码，没有 error 字段。当成正常的帧的话，客户端收到一个空的 200 答复，
+      // 看着像模型答了个空，理由也没有（2026-11-03，作者复查发现）。
+      if (isBusinessErrorEnvelope(chunk)) {
+        const code = businessCodeOfPayload(chunk) ?? 0;
+        const said = typeof chunk.msg === "string" ? chunk.msg : typeof chunk.message === "string" ? chunk.message : "";
+        throw withBusinessCode(
+          new AuthError(`upstream rejected the request (${code})`, said.slice(0, 300) || "upstream rejected the request", 502),
+          code,
         );
       }
       if (chunk.id) id = chunk.id;

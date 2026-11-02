@@ -33,6 +33,7 @@ export async function* openaiStreamToAnthropic(
   let inputTokens = 0;
   let outputTokens = 0;
   let cachedTokens = 0;
+  let writtenTokens = 0;
   let reasoningTokens = 0;
   // The OpenAI dialect reports the usage in the last chunk, which can arrive
   // after the chunk that carries the finish reason. The stream therefore is not
@@ -68,6 +69,7 @@ export async function* openaiStreamToAnthropic(
       inputTokens = chunk.usage.prompt_tokens ?? inputTokens;
       outputTokens = chunk.usage.completion_tokens ?? outputTokens;
       cachedTokens = cachedInputOfOpenAI(chunk.usage) || cachedTokens;
+      writtenTokens = chunk.usage.cache_creation_input_tokens ?? writtenTokens;
       reasoningTokens = chunk.usage.completion_tokens_details?.reasoning_tokens ?? reasoningTokens;
     }
     // After the finish reason the upstream may still send the usage; anything
@@ -169,16 +171,18 @@ export async function* openaiStreamToAnthropic(
     // client that reads them from the last frame finds them.
     usage: {
       // Anthropic 的 input_tokens 只算没命中缓存的（见 dialect/cache.ts）。
-      input_tokens: Math.max(0, inputTokens - cachedTokens),
+      input_tokens: Math.max(0, inputTokens - cachedTokens - writtenTokens),
       output_tokens: outputTokens,
       ...(cachedTokens ? { cache_read_input_tokens: cachedTokens } : {}),
+      ...(writtenTokens ? { cache_creation_input_tokens: writtenTokens } : {}),
       ...(reasoningTokens ? { output_tokens_details: { thinking_tokens: reasoningTokens } } : {}),
     },
   });
   onUsage?.({
-    input_tokens: Math.max(0, inputTokens - cachedTokens),
+    input_tokens: Math.max(0, inputTokens - cachedTokens - writtenTokens),
     output_tokens: outputTokens,
     ...(cachedTokens ? { cache_read_input_tokens: cachedTokens } : {}),
+    ...(writtenTokens ? { cache_creation_input_tokens: writtenTokens } : {}),
     ...(reasoningTokens ? { output_tokens_details: { thinking_tokens: reasoningTokens } } : {}),
   });
   yield sseEvent("message_stop", { type: "message_stop" });
@@ -189,6 +193,7 @@ export async function* anthropicStreamToOpenAI(
   body: ReadableStream<Uint8Array>,
   model: string,
   onUsage?: (usage: Json) => void,
+  signal?: AbortSignal,
 ): AsyncGenerator<string> {
   const completionId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -214,7 +219,7 @@ export async function* anthropicStreamToOpenAI(
       ...(usage ? { usage } : {}),
     });
 
-  for await (const ev of readSseEvents(body)) {
+  for await (const ev of readSseEvents(body, signal)) {
     if (!ev.data || ev.data === "[DONE]") continue;
     let evt: Json;
     try {
@@ -329,6 +334,7 @@ function openaiUsage(
     total_tokens: prompt + outputTokens,
     ...(cachedTokens ? { prompt_tokens_details: { cached_tokens: cachedTokens } } : {}),
     ...(cachedTokens ? { prompt_cache_hit_tokens: cachedTokens } : {}),
+    ...(writtenTokens ? { cache_creation_input_tokens: writtenTokens } : {}),
   };
 }
 

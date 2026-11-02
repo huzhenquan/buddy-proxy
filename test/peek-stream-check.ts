@@ -168,6 +168,51 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   check("空流 → 原样返回", out === body);
 }
 
+/* ------------------------------------------------------------------ *
+ * 6. 200 的正文里是一个错误信封（业务码在顶层）
+ * ------------------------------------------------------------------ */
+
+// 上游有时用 200 回一个错。这个信封没有 "error" 键，码在顶层：
+// { code: 11128, msg: "...", displayMsg: {...} }。不认它的话，这条请求会被
+// 当成一次成功的空答复 —— 客户端拿到一条空流，日志里是一次成功。
+{
+  const { readFixture } = await import("./fixture-name.ts");
+  const fixture = readFixture("workbuddy-channel-check-11128.json");
+  const recorded = fixture?.body ?? "";
+
+  for (const [name, payload] of [
+    ["整个正文就是那个信封", recorded],
+    ["包在一帧 data: 里", `data: ${recorded}\n\n`],
+  ] as const) {
+    const body = streamOf([payload]);
+    let caught: any = null;
+    try {
+      await peekStream(body);
+    } catch (e) {
+      caught = e;
+    }
+    check(`${name} → 抛 AuthError`, caught instanceof AuthError, String(caught));
+    check(`${name} → 业务码是 11128`, caught?.businessCode === 11128, String(caught?.businessCode));
+    check(
+      `${name} → hint 是上游自己那句话`,
+      caught?.hint === "Illegal API invocation from an unapproved channel",
+      String(caught?.hint),
+    );
+  }
+}
+
+// 正常的帧不能被当成错误信封：code 为 0 是「没有码」。
+{
+  const body = streamOf(['data: {"code":0,"data":{"x":1}}\n\n']);
+  let error: unknown = null;
+  try {
+    await peekStream(body);
+  } catch (e) {
+    error = e;
+  }
+  check("code 为 0 的正文不是错误", error === null, String(error));
+}
+
 /* ------------------------------------------------------------------ */
 
 console.log("");

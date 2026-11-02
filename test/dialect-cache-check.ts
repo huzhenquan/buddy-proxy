@@ -79,6 +79,28 @@ const fromWorkBuddy = openaiToAnthropicResponse(
 check("平台自己那套报法也认", fromWorkBuddy.usage?.input_tokens === 197, JSON.stringify(fromWorkBuddy.usage));
 check("平台报了多少命中就是多少", fromWorkBuddy.usage?.cache_read_input_tokens === 88448, JSON.stringify(fromWorkBuddy.usage));
 
+// WorkBuddy 有时两个字段都报，其中 prompt_tokens_details.cached_tokens 是 0，
+// 真的命中数在 prompt_cache_hit_tokens 里。用「第一个存在的」去取会拿到那个
+// 0 —— 缓存率看着像全 miss，其实命中了 99.8%（2026-11-02，作者复查发现）。
+const fromWorkBuddyBoth = openaiToAnthropicResponse(
+  {
+    choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
+    usage: {
+      prompt_tokens: 88645,
+      completion_tokens: 20,
+      prompt_tokens_details: { cached_tokens: 0 },
+      prompt_cache_hit_tokens: 88448,
+    },
+  },
+  "test-model",
+);
+check("两个字段都报时取那个非零的", fromWorkBuddyBoth.usage?.input_tokens === 197, JSON.stringify(fromWorkBuddyBoth.usage));
+check(
+  "两个字段都报时命中数也没被那个 0 盖掉",
+  fromWorkBuddyBoth.usage?.cache_read_input_tokens === 88448,
+  JSON.stringify(fromWorkBuddyBoth.usage),
+);
+
 const noCache = openaiToAnthropicResponse(
   {
     choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
@@ -104,6 +126,35 @@ const toOpenAI = anthropicToOpenAIResponse(
 check("prompt_tokens 是全部输入", toOpenAI.usage?.prompt_tokens === 3487, JSON.stringify(toOpenAI.usage));
 check("命中缓存的算在里面", toOpenAI.usage?.prompt_tokens_details?.cached_tokens === 3328, JSON.stringify(toOpenAI.usage));
 check("total_tokens 加上输出", toOpenAI.usage?.total_tokens === 3500, JSON.stringify(toOpenAI.usage));
+
+// 写进缓存的那部分（cache_creation）不该被丢掉：转成 OpenAI 再转回来，
+// 它还是「写进去」，不能变成「没命中」。
+const withCreation = anthropicToOpenAIResponse(
+  {
+    role: "assistant",
+    content: [{ type: "text", text: "hi" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 100, output_tokens: 5, cache_read_input_tokens: 200, cache_creation_input_tokens: 300 },
+  },
+  "test-model",
+);
+check("写进缓存的算在 prompt_tokens 里", withCreation.usage?.prompt_tokens === 600, JSON.stringify(withCreation.usage));
+check("写进缓存的有自己的字段", withCreation.usage?.cache_creation_input_tokens === 300, JSON.stringify(withCreation.usage));
+
+const backToAnthropic = openaiToAnthropicResponse(
+  {
+    choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
+    usage: {
+      prompt_tokens: 600,
+      completion_tokens: 5,
+      prompt_tokens_details: { cached_tokens: 200 },
+      cache_creation_input_tokens: 300,
+    },
+  },
+  "test-model",
+);
+check("转回来时写进去的还是写进去", backToAnthropic.usage?.cache_creation_input_tokens === 300, JSON.stringify(backToAnthropic.usage));
+check("转回来时没命中的只有 100", backToAnthropic.usage?.input_tokens === 100, JSON.stringify(backToAnthropic.usage));
 
 console.log("");
 console.log("流式");

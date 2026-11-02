@@ -18,9 +18,28 @@
 //
 // 所以模拟端把开头那一句换成自己的，剩下的提示词（工具约定、行为规则、
 // 上下文）原样送出去，一句不改。
+//
+// 模拟端自己那一句是什么？不能猜 —— 模拟端的指纹要跟官方客户端逐字一致。
+// 查的是装在这台机器上的官方客户端（WorkBuddy 4.24.5，它的 agent-harness
+// 与 product.json 在安装目录的 app.asar.unpacked/ 下）：
+//
+//   · cli/product.json 的 prompts 数组里，名字 cli-agent-prompt 的那条，
+//     模板开头就是 "You are CodeBuddy Code.\r\n\r\n"；
+//   · 同一句还在上游自己发的产品配置里（客户端数据目录下的 cache/
+//     acc-product-config-v3-*.json，prompts 里同名的那一条）；
+//   · 客户端自己的日志（同一目录下的 logs/…）里也是这一句。
+//
+// 所以就是这句。注意它没被换成 WorkBuddy：品牌替换（replaceBrandName）
+// 只作用在「随包的技能」上，产品配置里的提示词模板是上游原样下发的。
+//
+// 查出来的结论（还有缓存那部分输入的两个字段）写在同目录的 FINDINGS.md 里。
 
-/** 模拟端自己的开场白：调用方没有系统提示词时送的就是它。 */
-export const DEFAULT_SYSTEM = "You are a helpful assistant.";
+/**
+ * 模拟端自己的开场白：调用方没有系统提示词时送的就是它。
+ *
+ * 与官方客户端逐字一致（见上面的出处）。
+ */
+export const DEFAULT_SYSTEM = "You are CodeBuddy Code.";
 
 /**
  * 别的客户端的自报家门，开头那句。
@@ -61,6 +80,8 @@ export function rewriteSystemContent(content: unknown): unknown {
   // 多段系统提示词：只有第一段是「开头」，后面的段上游不看开头。
   return content.map((part, index) => {
     if (index !== 0) return part;
+    // 第一段就是一段纯文本的时候，那段文本就是开头。
+    if (typeof part === "string") return rewriteIdentity(part);
     if (!part || typeof part !== "object") return part;
     const text = (part as { text?: unknown }).text;
     if (typeof text !== "string") return part;

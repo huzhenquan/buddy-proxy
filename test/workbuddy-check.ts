@@ -93,6 +93,14 @@ console.log("the identity of the caller");
 const foreign = "You are Claude Code, Anthropic's official CLI for Claude.";
 const systemOf = (b: any): string => String(b.messages[0]?.content ?? "");
 
+// The simulated client's own opening line has to be the official client's,
+// byte for byte (AGENTS.md: 模拟端的指纹要跟上游的封闭客户端对齐).
+// The official one is "You are CodeBuddy Code." — the first line of the
+// cli-agent-prompt template in the client's product.json and in the product
+// config the upstream itself serves.
+const { DEFAULT_SYSTEM } = await import("../lib/workbuddy/identity.ts");
+check("the simulated client's line is the official one", DEFAULT_SYSTEM === "You are CodeBuddy Code.", DEFAULT_SYSTEM);
+
 const rewritten = buildChatBody(
   { model: "hy3", messages: [{ role: "system", content: `${foreign}\n\nThe rest of the prompt.` }, { role: "user", content: "hi" }] },
   model,
@@ -100,7 +108,7 @@ const rewritten = buildChatBody(
 check("the foreign opening line is gone", !systemOf(rewritten).startsWith(foreign), systemOf(rewritten).slice(0, 80));
 check("no half sentence is left behind", !systemOf(rewritten).includes("Anthropic's official CLI"), systemOf(rewritten).slice(0, 80));
 check("the rest of the prompt is kept", systemOf(rewritten).includes("The rest of the prompt."));
-check("the simulated client's own line is used", systemOf(rewritten).startsWith("You are a helpful assistant."), systemOf(rewritten).slice(0, 40));
+check("the simulated client's own line is used", systemOf(rewritten).startsWith(DEFAULT_SYSTEM), systemOf(rewritten).slice(0, 40));
 
 const lowercase = buildChatBody(
   { model: "hy3", messages: [{ role: "system", content: foreign.toLowerCase() }, { role: "user", content: "hi" }] },
@@ -116,16 +124,16 @@ const spaced = buildChatBody(
 check("leading spaces do not hide the opening", !systemOf(spaced).toLowerCase().includes("claude code"), systemOf(spaced));
 
 const inside = buildChatBody(
-  { model: "hy3", messages: [{ role: "system", content: `You are a helpful assistant.\n${foreign}` }, { role: "user", content: "hi" }] },
+  { model: "hy3", messages: [{ role: "system", content: `${DEFAULT_SYSTEM}\n${foreign}` }, { role: "user", content: "hi" }] },
   model,
 );
 check("a line that is not the opening one is left alone", systemOf(inside).includes(foreign), systemOf(inside));
 
 const plain = buildChatBody(
-  { model: "hy3", messages: [{ role: "system", content: "You are a helpful assistant." }, { role: "user", content: "hi" }] },
+  { model: "hy3", messages: [{ role: "system", content: DEFAULT_SYSTEM }, { role: "user", content: "hi" }] },
   model,
 );
-check("an ordinary system prompt is untouched", systemOf(plain) === "You are a helpful assistant.", systemOf(plain));
+check("an ordinary system prompt is untouched", systemOf(plain) === DEFAULT_SYSTEM, systemOf(plain));
 
 const inUser = buildChatBody(
   { model: "hy3", messages: [{ role: "user", content: foreign }] },
@@ -143,6 +151,17 @@ const parts = inParts.messages[0]?.content as Array<{ text?: string }>;
 check("the first part of a system prompt in parts is rewritten", !String(parts?.[0]?.text ?? "").toLowerCase().includes("claude code"), String(parts?.[0]?.text));
 check("the other parts are kept", String(parts?.[1]?.text ?? "") === "more", String(parts?.[1]?.text));
 
+// 多段系统提示词里，第一段就是一段纯文本的时候，那段文本就是开头。
+{
+  const plainParts = buildChatBody(
+    { model: "hy3", messages: [{ role: "system", content: [foreign, "more"] }, { role: "user", content: "hi" }] },
+    model,
+  );
+  const first = (plainParts.messages[0]?.content as unknown[])?.[0];
+  check("a plain first part is rewritten too", !String(first ?? "").toLowerCase().includes("claude code"), String(first));
+  check("the rest is kept", String((plainParts.messages[0]?.content as unknown[])?.[1]) === "more");
+}
+
 // The caller's body must not be touched: the same body goes to the other
 // upstreams of a published model, one after the other.
 const shared = { model: "hy3", messages: [{ role: "system", content: foreign }, { role: "user", content: "hi" }] };
@@ -150,10 +169,145 @@ buildChatBody(shared, model);
 check("the caller's body is not rewritten", String((shared.messages[0] as any).content) === foreign, String((shared.messages[0] as any).content));
 
 console.log("");
+console.log("the recorded channel check");
+
+// 上游拒了非官方客户端的那一次答复，录下来了（fixtures 里）。它证明了
+// 「渠道校验」这件事存在，也证明了业务码是 11128 —— 日志与面板要靠它认出
+// 这是风控，不是参数写错。
+{
+  const { readFixture } = await import("./fixture-name.ts");
+  const fixture = readFixture("workbuddy-channel-check-11128.json");
+  const body = fixture?.body ?? "";
+  const { businessCodeOfBody } = await import("../lib/upstream-status.ts");
+  check("录下来的答复在", Boolean(fixture), "fixture missing");
+  check("它是 400", fixture?.status === 400, String(fixture?.status));
+  check("业务码是 11128", businessCodeOfBody(body) === 11128, String(businessCodeOfBody(body)));
+  check("正文里说的是渠道校验", body.includes("unapproved channel"), body.slice(0, 120));
+  check("正文里没有账号标识", !body.includes("@") && !body.includes("user_id"), body.slice(0, 120));
+}
+
+console.log("");
+console.log("the channel check inside a 200");
+
+// 上游有时用 200 回一个错。正文是 JSON 信封（业务码 + 说明），不是 SSE。
+// 非流式那条路要认出它 —— 当成正常的帧的话，客户端收到一个空的 200 答复，
+// 看着像模型答了个空，理由也没有（2026-11-03，作者复查发现）。
+{
+  const { aggregateStream } = await import("../lib/workbuddy/transport.ts");
+  const envelope = JSON.stringify({
+    code: 11128,
+    msg: "Illegal API invocation from an unapproved channel",
+    requestId: "00000000-0000-4000-8000-000000000000",
+  });
+  const response = new Response(`data: ${envelope}\n\n`, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
+  let caught: any = null;
+  try {
+    await aggregateStream(response, "hy3");
+  } catch (e) {
+    caught = e;
+  }
+  check("它报错了", caught !== null, String(caught));
+  check("报的是上游拒了", String(caught?.message ?? "").includes("rejected"), String(caught?.message));
+  const { businessCodeOf } = await import("../lib/upstream-status.ts");
+  check("业务码是 11128", businessCodeOf(caught) === 11128, String(businessCodeOf(caught)));
+  check("理由留给客户端看", String(caught?.hint ?? "").includes("unapproved channel"), String(caught?.hint));
+}
+
+console.log("");
+console.log("the credential log");
+
+// 凭据被拒时，正文进凭据日志（数据卷里的 auth.log），不进 stdout。
+// 正文里可能有账号标识、令牌、邮箱，进文件之前先按字段抹一遍。
+{
+  const { scrubForLog } = await import("../lib/log-scrub.ts");
+  const scrubbed = scrubForLog(
+    JSON.stringify({
+      code: 401,
+      msg: "token invalid",
+      access_token: "abcdef0123456789abcdef0123456789",
+      email: "someone@example.com",
+      user_id: "00000000-0000-4000-8000-00000000cafe",
+      requestId: "00000000-0000-4000-8000-000000000000",
+    }),
+  );
+  check("令牌被抹掉", !scrubbed.includes("abcdef0123456789"), scrubbed);
+  check("邮箱被抹掉", !scrubbed.includes("someone@example.com"), scrubbed);
+  check("账号 id 被抹掉", !scrubbed.includes("00000000-0000-4000-8000-00000000cafe"), scrubbed);
+  check("能看懂的那部分留着", scrubbed.includes("token invalid"), scrubbed);
+  check("正文够短", scrubbed.length <= 200, String(scrubbed.length));
+
+  const plain = scrubForLog("upstream said no");
+  check("没有 JSON 也不出错", plain === "upstream said no", plain);
+  check("空正文还是空的", scrubForLog("") === "");
+
+  // JWT 那种带点的长串：不在敏感字段名下面，也会漏出去。
+  const jwt = scrubForLog(
+    JSON.stringify({ msg: "token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk rejected" }), // privacy:allow — 编造的样例（RFC 7515 里的那个例子 JWT）
+  );
+  check("JWT 被抹掉", !jwt.includes("eyJhbGciOiJIUzI1NiJ9"), jwt);
+  check("JWT 后面那句话留着", jwt.includes("rejected"), jwt);
+
+  // 正文不是 JSON 时，邮箱照样得抹掉。
+  const free = scrubForLog("the account someone@example.com is not allowed");
+  check("不是 JSON 时的邮箱也被抹掉", !free.includes("someone@example.com"), free);
+  check("不是 JSON 时那句话还读得懂", free.includes("not allowed"), free);
+
+  // 驼峰写法的字段名：accessToken 这种 32 位的令牌既没有 sk- 前缀、也不
+  // 够 40 个字符，按文本里的规则接不住 —— 得按字段名抹（2026-11-03）。
+  const camel = scrubForLog(
+    JSON.stringify({
+      accessToken: "0123456789abcdef0123456789abcdef",
+      refreshToken: "fedcba9876543210fedcba9876543210",
+      userId: "acct-8837",
+      id: "acct-4242",
+      msg: "the token is stale",
+    }),
+  );
+  check("驼峰的 accessToken 被抹掉", !camel.includes("0123456789abcdef"), camel);
+  check("驼峰的 refreshToken 被抹掉", !camel.includes("fedcba9876543210"), camel);
+  check("驼峰的 userId 被抹掉", !camel.includes("acct-8837"), camel);
+  check("光秃秃的 id 被抹掉", !camel.includes("acct-4242"), camel);
+  check("那句话还读得懂", camel.includes("the token is stale"), camel);
+
+  // 流式上游的正文是 SSE 帧：前面有 `data: `，不剥掉那层壳就当不成 JSON，
+  // 「按字段抹」的规则整条失效（2026-11-03）。
+  const sse = scrubForLog(
+    'data: {"code":401,"msg":"token invalid","accessToken":"0123456789abcdef0123456789abcdef"}\n\n',
+  );
+  check("SSE 帧里的令牌被抹掉", !sse.includes("0123456789abcdef"), sse);
+  check("SSE 帧里那句话留着", sse.includes("token invalid"), sse);
+
+  // 请求 id 抹了就没法跟上游的日志对上了：那几个不是账号标识，留着。
+  const trace = scrubForLog(JSON.stringify({ requestId: "req-123456", traceId: "trace-9", userId: "acct-1" }));
+  check("请求 id 留着", trace.includes("req-123456"), trace);
+  check("追踪 id 留着", trace.includes("trace-9"), trace);
+  check("账号 id 还是被抹掉", !trace.includes("acct-1"), trace);
+
+  // 流式上游的正文是**多帧**。整段当一坨去 parse 一定失败 —— 那样「按字段
+  // 抹」的规则对流式上游一点用都没有（2026-11-03，作者复查发现）。
+  const multi = scrubForLog(
+    'data: {"id":"c1","accessToken":"0123456789abcdef0123456789abcdef"}\n\ndata: [DONE]\n\n',
+  );
+  check("多帧里的令牌被抹掉", !multi.includes("0123456789abcdef"), multi);
+  check("多帧里的那个 id 也被抹掉", !multi.includes('"id":"c1"'), multi);
+
+  // 复数与连字符的字段名：一样要抹。
+  const plural = scrubForLog(
+    JSON.stringify({ tokens: "0123456789abcdef0123456789abcdef", "user-id": "acct-77", accessTokens: "aaaabbbbccccddddeeeeffff00001111" }),
+  );
+  check("复数的 tokens 被抹掉", !plural.includes("0123456789abcdef"), plural);
+  check("连字符的 user-id 被抹掉", !plural.includes("acct-77"), plural);
+  check("复数的 accessTokens 被抹掉", !plural.includes("aaaabbbbccccddddeeeeffff00001111"), plural);
+}
+
+console.log("");
 console.log("the conversation id");
 
 const messages = [
-  { role: "system", content: "You are a helpful assistant." },
+  { role: "system", content: "You are CodeBuddy Code." },
   { role: "user", content: "the first question" },
 ];
 const first = conversationIdFor(messages);

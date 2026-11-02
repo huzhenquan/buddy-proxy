@@ -8,6 +8,7 @@ import type { Json } from "../../json.ts";
 import crypto from "node:crypto";
 import type Koa from "koa";
 import { AuthError } from "../../credential.ts";
+import { businessCodeOfPayload, isBusinessErrorEnvelope, withBusinessCode } from "../../upstream-status.ts";
 import { anthropicToOpenAI, effortOf } from "../../dialect/request.ts";
 import {
   qoderProtocolForRegion,
@@ -218,23 +219,33 @@ async function* legacyWithRetry(
   for (let attempt = 1; ; attempt++) {
     const upstream = await send();
     const frames = readLegacyFrames(upstream.body!)[Symbol.asyncIterator]();
-    const first = await frames.next();
+    try {
+      const first = await frames.next();
 
-    if (!first.done && first.value.error && attempt < maxAttempts && isRetryableLegacy(first.value.error)) {
-      await new Promise((r) => setTimeout(r, retryMs));
-      continue;
+      if (!first.done && first.value.error && attempt < maxAttempts && isRetryableLegacy(first.value.error)) {
+        await new Promise((r) => setTimeout(r, retryMs));
+        continue;
+      }
+      if (!first.done) {
+        if (first.value.error) throw legacyError(first.value.error);
+        if (first.value.chunk) yield first.value.chunk;
+      }
+      while (true) {
+        const next = await frames.next();
+        if (next.done) break;
+        if (next.value.error) throw legacyError(next.value.error);
+        if (next.value.chunk) yield next.value.chunk;
+      }
+      return;
+    } finally {
+      // 客户端走了（调用方不再读这个生成器）时，把这一条上游的流取消掉：它还
+      // 在吐字就是在计费，账号还占着。取消不了就算了（上游自己会超时）。
+      try {
+        await frames.return?.(undefined);
+      } catch {
+        /* 已经结束了 */
+      }
     }
-    if (!first.done) {
-      if (first.value.error) throw legacyError(first.value.error);
-      if (first.value.chunk) yield first.value.chunk;
-    }
-    while (true) {
-      const next = await frames.next();
-      if (next.done) break;
-      if (next.value.error) throw legacyError(next.value.error);
-      if (next.value.chunk) yield next.value.chunk;
-    }
-    return;
   }
 }
 
@@ -281,6 +292,16 @@ export async function collectOpenAIChunks(
 
   for await (const chunk of chunks) {
     if (chunk.usage) usage = chunk.usage;
+    // 上游有时用 200 回一个错：正文里只有业务码，没有答复。当成正常的帧
+    // 的话，客户端收到一个空的 200 答复（2026-11-03）。
+    if (isBusinessErrorEnvelope(chunk)) {
+      const code = businessCodeOfPayload(chunk) ?? 0;
+      const said = typeof chunk.msg === "string" ? chunk.msg : typeof chunk.message === "string" ? chunk.message : "";
+      throw withBusinessCode(
+        new AuthError(`upstream rejected the request (${code})`, said.slice(0, 300) || "upstream rejected the request", 502),
+        code,
+      );
+    }
     const choice = chunk.choices?.[0];
     if (!choice) continue;
     const delta = choice.delta ?? {};

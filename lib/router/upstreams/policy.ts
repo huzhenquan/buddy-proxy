@@ -11,6 +11,7 @@ import { TokenRhythmNoBalanceError } from "../../tokenrhythm/transport.ts";
 import { byOrder, classifyUpstreamError, describeUpstreamError, isDegradableUpstreamError, isNoBalanceFailure, selectProvider } from "../provider-selection.ts";
 import {
   businessCodeOf,
+  businessCodeOfBody,
   cooldownUntilOf,
   upstreamStatusOf,
   withBusinessCode,
@@ -18,11 +19,12 @@ import {
   withUpstreamStatus,
 } from "../../upstream-status.ts";
 import { clearCooldown, cooldownUntil, isCoolingDown, setCooldown } from "../../cooldown.ts";
+import { scrubForLog } from "../../log-scrub.ts";
 import { cooldownForFailure, cooldownStamp, errorTextOf } from "../account-cooldown.ts";
 import { accountsOfPlatform, type ProviderRow } from "../../providers.ts";
 import { platformPolicy } from "../../platforms.ts";
 import { platformWithoutAccount } from "../routes.ts";
-import { withRetryAfter } from "../deliver.ts";
+import { withRetryAfter, ClientGoneError } from "../deliver.ts";
 
 /** What the adapters need to know about the router they run in. */
 export interface UpstreamContext {
@@ -101,7 +103,11 @@ export function upstreamStatusError(
   retryAfterMs?: number,
 ): AuthError {
   // 正文只进 hint，日志与用量表只记 message。上游为什么拒，只能靠这一行。
-  console.warn(`[UPSTREAM] ${what}上游 ${status}：${text.slice(0, 500)}`);
+  //
+  // stdout 是容器日志：它会被复制、归档、发到别处 —— 那里不该有账号标识、
+  // 邮箱、令牌这样的东西。所以打出去之前先抹一遍（正文本身不丢，只是敏感值
+  // 没了）。
+  console.warn(`[UPSTREAM] ${what}上游 ${status}：${scrubForLog(text, 500)}`);
   const error = new AuthError(
     `upstream HTTP ${status}`,
     `${what}上游返回 ${status}：${text.slice(0, 300)}`,
@@ -228,25 +234,6 @@ async function runWithRateWait<T>(
       );
       await sleep(wait);
     }
-  }
-}
-
-/**
- * 平台自己的码（如果错误信封里有）。
- *
- * 状态码说的是「这个请求被拒了」，业务码说的是「为什么」：墨点用完
- * （quota_exceeded）与限流（rate_limit_exceeded）都是 429，换一个账号的结果
- * 却不一样。
- */
-function businessCodeOfBody(text: string): number | string | null {
-  try {
-    const parsed = text ? JSON.parse(text) : null;
-    const code = parsed?.error?.code ?? parsed?.code ?? null;
-    if (typeof code === "string" && code.trim()) return code.trim();
-    if (typeof code === "number" && Number.isFinite(code)) return code;
-    return null;
-  } catch {
-    return null;
   }
 }
 
@@ -432,6 +419,12 @@ export function settlement(): Settlement {
     failure(error: unknown): void {
       if (settled || !accountId) return;
       settled = true;
+      // 客户端走了：账号没有问题，答复只是没人要。所以既不记冷却，也不把它
+      // 写成「这个账号接不了」——那会把一个好好的账号说成坏的。
+      if (error instanceof ClientGoneError) {
+        console.log(`[ROUTE] ${what} account=${accountId}: the client went away, the answer was cut short`);
+        return;
+      }
       // 这次失败值多少冷却：可降级的失败才记，请求本身的问题不记。
       const decision = cooldownForFailure(accountId, error);
       if (decision) {
@@ -551,6 +544,12 @@ export async function underPolicy<T>(
         } catch (e) {
           console.warn(`[ROUTE] ${what} account=${candidate.id} cannot clear its cooldown: ${errorText(e)}`);
         }
+        return;
+      }
+      // 客户端走了：账号没有问题，答复只是没人要。不换账号（换了也一样没人
+      // 要），也不说这个账号「接不了」——那会把一个好好的账号说成坏的。
+      if (error instanceof ClientGoneError) {
+        console.log(`[ROUTE] ${what} account=${candidate.id}: the client went away, the answer was cut short`);
         return;
       }
       // 这次失败值多少冷却：可降级的失败才记，请求本身的问题不记。

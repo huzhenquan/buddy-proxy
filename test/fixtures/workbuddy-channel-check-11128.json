@@ -1,0 +1,8 @@
+{
+  "upstream": "https://www.workbuddy.cn/v2/chat/completions",
+  "status": 400,
+  "headers": {
+    "content-type": "application/json; charset=utf-8"
+  },
+  "body": "{\"code\":11128,\"msg\":\"Illegal API invocation from an unapproved channel\",\"requestId\":\"00000000-0000-4000-8000-000000000000\",\"retry_policy\":{\"retry\":false},\"displayMsg\":{\"en\":\"Request blocked. Please send it again\",\"zh\":\"请求被拦截，请重新发送\",\"zh-hant\":\"請求已被攔截，請重新傳送\"},\"displayTips\":{\"en\":\"This call failed channel verification, possibly because it was not sent by the official client. Please send it again with the official version.\",\"zh\":\"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。\",\"zh-hant\":\"這次呼叫沒通過渠道校驗，可能不是官方客戶端發出的。請用官方版本重新傳送。\"}}"
+}
