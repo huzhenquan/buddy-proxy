@@ -14,6 +14,7 @@ import {
   type QoderRegion,
 } from "./auth.ts";
 import { clearHint } from "../session.ts";
+import { scrubForLog } from "../log-scrub.ts";
 
 export interface QoderAccountHealth {
   region: QoderRegion;
@@ -68,7 +69,7 @@ export async function fetchQoderCredits(providerId = "qoder"): Promise<QoderCred
       // 正文只在这一处拿得到：额度读不出来时面板上只会写「没有额度」，
       // 没人知道上游到底答了什么。
       const text = await r.text().catch(() => "");
-      console.warn(`[UPSTREAM] Qoder 额度查询 ${r.status}：${text.slice(0, 300)}`);
+      console.warn(`[UPSTREAM] Qoder 额度查询 ${r.status}：${scrubForLog(text, 300)}`);
       return null;
     }
     const body = await r.json().catch(() => undefined);
@@ -115,7 +116,7 @@ export async function checkAccountHealth(providerId = "qoder"): Promise<QoderAcc
     }
     const code = body?.errorCode ?? body?.code ?? `HTTP ${r.status}`;
     // 只留一个代码在面板上，上游到底说了什么只有这里知道。
-    console.warn(`[UPSTREAM] Qoder 账号状态 ${r.status}：${text.slice(0, 300)}`);
+    console.warn(`[UPSTREAM] Qoder 账号状态 ${r.status}：${scrubForLog(text, 300)}`);
     return {
       region,
       authorized: false,

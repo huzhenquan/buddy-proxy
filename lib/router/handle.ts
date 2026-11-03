@@ -45,7 +45,7 @@ import {
   type RoutingContext,
 } from "./routes.ts";
 import { findAggregate, modelsOfPlatform } from "./catalog-routes.ts";
-import { sendError } from "./deliver.ts";
+import { ClientGoneError, sendError } from "./deliver.ts";
 
 const TOKENRHYTHM_MAX_ATTEMPTS = configNumber("TOKENRHYTHM_MAX_ATTEMPTS", 3);
 // The legacy endpoint queues models and reports 429 while a request waits. The
@@ -218,6 +218,12 @@ async function handleAggregate(
     await select({
       strategy: entry.strategy,
       candidates,
+      // 客户端走了不是上游的错：不能再打下一个目标。
+      //
+      // 别的错都往下走（这是根路由一贯的做法）：换一个上游也许能答得出来。
+      // 但客户端走了 —— 连接都断了，换谁都一样没人要；而且下一个目标还会
+      // 再占一个账号、再花一份上游的钱（那个上游不知道客户端已经不要了）。
+      degradable: (error) => !(error instanceof ClientGoneError),
       // Why the traffic went somewhere else: the target that failed, why it
       // failed, and which one takes the request now.
       onAttempt: (candidate, error) => {
@@ -225,6 +231,11 @@ async function handleAggregate(
         // The answer had already started: there is nothing to fall back to.
         const stopped = error instanceof SelectionStop;
         const reason = stopped ? error.reason : error;
+        // 客户端走了：这个错不参与挑选，也没有下一个目标了。
+        if (reason instanceof ClientGoneError) {
+          console.log(`[ROUTE] ${candidate.id}：客户端走了，答复没送出去`);
+          return;
+        }
         // 答复已经开始的那个错不参与挑选：那时已经没有选择了。
         if (!stopped) failures.push({ id: candidate.id, error: reason });
         const at = ordered.findIndex((c) => c.id === candidate.id);
@@ -239,6 +250,9 @@ async function handleAggregate(
         );
       },
       failure: (lastError) => {
+        // 客户端走了：这个错要原样出去（答复那一层认它：499，不写正文）。
+        // 把它包成别的错，客户端就会收到一个「上游挂了」的样子 —— 而上游没坏。
+        if (lastError instanceof ClientGoneError) return lastError;
         // 最后一个失败说了算是不对的：前面那个可能是「这个账号没额度」，最后
         // 那个是「这个上游没有这个模型」—— 客户端拿到后者就会去改模型名，而
         // 真正该做的是等额度恢复。所以挑最有说明力的那个。
@@ -489,7 +503,9 @@ async function callUpstream(
     recordRequestUsage(body, route, agent, session, uctx, ctx.status || 200, started, "", kind?.label ?? route.platform);
   } catch (e) {
     const err = e as AuthError;
-    const status = typeof err?.status === "number" ? err.status : 500;
+    // 客户端走了：答复那一层给客户端的是 499，用量表也记 499，不要记成 500
+    // —— 500 是「上游挂了」，而上游没坏，只是没人要了。
+    const status = e instanceof ClientGoneError ? 499 : typeof err?.status === "number" ? err.status : 500;
     recordRequestUsage(
       body,
       route,

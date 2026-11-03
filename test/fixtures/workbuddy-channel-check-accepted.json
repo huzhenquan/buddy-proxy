@@ -1,0 +1,55 @@
+{
+  "upstream": "https://www.workbuddy.cn/v2/chat/completions",
+  "status": 200,
+  "headers": {
+    "content-type": "text/event-stream"
+  },
+  "requestBody": {
+    "model": "hy3",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are CodeBuddy Code.\n\nYou are a helpful assistant. Answer briefly."
+      },
+      {
+        "role": "user",
+        "content": "say ok"
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  },
+  "requestHeaderNames": [
+    "Accept",
+    "Accept-Encoding",
+    "Authorization",
+    "Content-Type",
+    "User-Agent",
+    "X-Agent-Intent",
+    "X-Agent-Purpose",
+    "X-B3-ParentSpanId",
+    "X-B3-Sampled",
+    "X-B3-SpanId",
+    "X-B3-TraceId",
+    "X-Conversation-ID",
+    "X-Conversation-Message-ID",
+    "X-Conversation-Request-ID",
+    "X-Domain",
+    "X-IDE-Name",
+    "X-IDE-Type",
+    "X-IDE-Version",
+    "X-Private-Data",
+    "X-Product",
+    "X-Request-ID",
+    "X-Trace-ID",
+    "X-User-Id",
+    "acp-connection-id",
+    "b3",
+    "traceparent",
+    "x-codebuddy-request",
+    "x-requested-with"
+  ],
+  "body": ": heartbeat\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\"User\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\" says\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\" \\\"\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\"say ok\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\"\\\".\\n\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\"I\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\" should\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\" answer\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\" briefly\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\" as\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\" per\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\" instructions\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\".\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\"\\nSo\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\" I\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\" will say \\\"\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\"ok\\\".\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\",\"reasoning_content\":\"\",\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"\"}],\"usage\":null}\n\ndata: {\"id\":\"00000000000000000000000000000000\",\"model\":\"hy3\",\"object\":\"chat.completion.chunk\",\"created\":1793667887,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"\",\"function_call\":{\"name\":\"\",\"arguments\":\"\"},\"refusal\":\"\",\"tool_calls\":[],\"extra_fields\":null},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":25,\"total_tokens\":55,\"completion_tokens_details\":{\"accepted_prediction_tokens\":0,\"audio_tokens\":0,\"reasoning_tokens\":22,\"rejected_prediction_tokens\":0,\"cached_tokens\":0},\"prompt_tokens_details\":{\"accepted_prediction_tokens\":0,\"audio_tokens\":0,\"reasoning_tokens\":0,\"rejected_prediction_tokens\":0,\"cached_tokens\":0},\"prompt_cache_hit_tokens\":0,\"prompt_cache_miss_tokens\":30,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"prompt_cache_write_tokens\":0,\"completion_thinking_tokens\":22,\"credit\":0,\"cached_tokens\":0}}\n\ndata: [DONE]\n\n"
+}

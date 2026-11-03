@@ -22,6 +22,7 @@ import {
   type QoderRegion,
 } from "./auth.ts";
 import { AuthError } from "../credential.ts";
+import { scrubForLog } from "../log-scrub.ts";
 import { withUpstreamStatus } from "../upstream-status.ts";
 
 const USER_AGENT = "qoder/1.1.74";
@@ -83,6 +84,8 @@ export interface QoderRequestOptions {
   /** Which provider (which account) to talk to. */
   providerId?: string;
   region?: QoderRegion;
+  /** 客户端走了就断掉这个信号：上游还在算就是在计费。 */
+  signal?: AbortSignal;
 }
 
 /** The session ids the gateway expects on every request. */
@@ -151,6 +154,8 @@ export async function qoderChatCompletion(
     method: "POST",
     headers,
     body: JSON.stringify(buildBody(body, opts.stream)),
+    // 客户端走了就把这次请求掐掉：上游还在算就是在计费，账号还占着。
+    signal: opts.signal,
   });
   if (r.status === 401) {
     // The client sees the gateway's status; the upstream's own status says
@@ -159,7 +164,7 @@ export async function qoderChatCompletion(
     // 上游说为什么拒（令牌过期？IP 不在名单？）只有正文里有，而这里原来
     // 一点不留：容器一重建，拒的理由就查不到了。
     const text = await r.text().catch(() => "");
-    console.warn(`[UPSTREAM] Qoder 上游 ${r.status}：${text.slice(0, 500)}`);
+    console.warn(`[UPSTREAM] Qoder 上游 ${r.status}：${scrubForLog(text, 500)}`);
     const error = new AuthError(
       `upstream rejected the credential (HTTP 401)`,
       `Qoder 拒绝了当前凭据。删掉 session 文件后重启服务即可重新登录。`,
@@ -180,7 +185,7 @@ export async function qoderChatCompletion(
     // 排查的人会被带偏。
     const why = detail?.queued === true || r.status === 403 ? "排队" : "繁忙";
     console.warn(
-      `[UPSTREAM] Qoder ${why}，${detail?.retryAfterSec ?? 10} 秒后重试：${text.slice(0, 300)}`,
+      `[UPSTREAM] Qoder ${why}，${detail?.retryAfterSec ?? 10} 秒后重试：${scrubForLog(text, 300)}`,
     );
     const error = new LimitError(
       `qoder model is queued (HTTP ${r.status})`,
@@ -197,7 +202,7 @@ export async function qoderChatCompletion(
     //
     // 正文只放在 hint 里，而日志与用量表都只记 message。上游为什么拒，
     // 只能靠这一行（容器一重建，hint 就没了）。
-    console.warn(`[UPSTREAM] Qoder 上游 ${r.status}：${text.slice(0, 500)}`);
+    console.warn(`[UPSTREAM] Qoder 上游 ${r.status}：${scrubForLog(text, 500)}`);
     const error = new AuthError(
       `upstream HTTP ${r.status}`,
       `Qoder 上游返回 ${r.status}：${text.slice(0, 300)}`,

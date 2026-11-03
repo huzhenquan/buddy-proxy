@@ -1,5 +1,6 @@
 import type { Json } from "../json.ts";
 import { randomUUID } from "node:crypto";
+import { anthropicUsageOf, openAIUsageOf } from "./cache.ts";
 
 
 
@@ -44,11 +45,8 @@ export function openaiToAnthropicResponse(body: Json, model: string): Json {
     stop_reason: stopReason,
     stop_sequence: null,
     usage: {
-      input_tokens: body?.usage?.prompt_tokens ?? 0,
-      output_tokens: body?.usage?.completion_tokens ?? 0,
-      ...(body?.usage?.prompt_tokens_details?.cached_tokens
-        ? { cache_read_input_tokens: body.usage.prompt_tokens_details.cached_tokens }
-        : {}),
+      // Anthropic 的 input_tokens 只算没命中缓存的（见 dialect/cache.ts）。
+      ...anthropicUsageOf(body?.usage, body?.usage?.completion_tokens ?? 0),
       ...(body?.usage?.completion_tokens_details?.reasoning_tokens
         ? { output_tokens_details: { thinking_tokens: body.usage.completion_tokens_details.reasoning_tokens } }
         : {}),
@@ -94,10 +92,8 @@ export function anthropicToOpenAIResponse(body: Json, model: string): Json {
     created: Math.floor(Date.now() / 1000),
     model,
     choices: [{ index: 0, message, finish_reason: stopReason }],
-    usage: {
-      prompt_tokens: body?.usage?.input_tokens ?? 0,
-      completion_tokens: body?.usage?.output_tokens ?? 0,
-      total_tokens: (body?.usage?.input_tokens ?? 0) + (body?.usage?.output_tokens ?? 0),
-    },
+    // OpenAI 的 prompt_tokens 是全部输入，命中缓存的那部分算在里面
+    // （见 dialect/cache.ts）。
+    usage: openAIUsageOf(body?.usage),
   };
 }

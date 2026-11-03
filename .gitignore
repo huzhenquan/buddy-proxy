@@ -34,6 +34,9 @@ tools/
 web/node_modules/
 web/dist/
 
+# The IDE's own files: they carry this machine's paths.
+.idea/
+
 # 这台机器专用的 mise 任务
 mise.local.toml
 

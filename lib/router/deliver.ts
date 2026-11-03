@@ -13,7 +13,9 @@ import { AuthError } from "../credential.ts";
 import { LimitError } from "../qoder/transport.ts";
 import { anthropicStreamToOpenAI, openaiStreamToAnthropic } from "../dialect/stream.ts";
 import { anthropicToOpenAIResponse, openaiToAnthropicResponse } from "../dialect/response.ts";
-import { parseLooseJson, readOpenAIChunks, readSseEvents, sseData, sseEvent, SSE_DONE } from "../sse-stream.ts";
+import { parseLooseJson, readOpenAIChunks, readOrAbort, readSseEvents, sseData, sseEvent, SSE_DONE } from "../sse-stream.ts";
+import { businessCodeOfPayload, isBusinessErrorEnvelope, withBusinessCode } from "../upstream-status.ts";
+import { scrubForLog } from "../log-scrub.ts";
 
 export type Dialect = "anthropic" | "openai";
 
@@ -46,13 +48,294 @@ function sseHead(ctx: Koa.Context): void {
   ctx.res.flushHeaders?.();
 }
 
-/** Write a frame, and say whether the client is still there. */
-function writeSafe(ctx: Koa.Context, chunk: string | Uint8Array): boolean {
+/**
+ * 等多久算「客户端不读了」（毫秒）。
+ *
+ * 客户端只是读得慢时，等着是对的；但一个连着 socket 却永远不读的客户端，
+ * 会把这条请求、上游的流、账号和套接字一起吊住。`app.ts` 里没有
+ * `server.timeout`，上游那个 300 秒的 abort 也救不了——到那时候上游早就不
+ * 读了。所以这里自己设一个上限：到了就断开这个连接，当作「客户端没了」。
+ */
+const DRAIN_TIMEOUT_MS = 45_000;
+
+/**
+ * 等多久算「客户端不读了」（毫秒）。
+ *
+ * 可以用 BUDDY_DRAIN_TIMEOUT_MS 改（测试要把它调短）。默认 45 秒。
+ */
+function drainTimeoutMs(): number {
+  const value = Number(process.env.BUDDY_DRAIN_TIMEOUT_MS ?? 0);
+  if (Number.isFinite(value) && value > 0) return value;
+  return DRAIN_TIMEOUT_MS;
+}
+
+/**
+ * 一条答复的状态：客户端还在不在。
+ *
+ * 每一段答复一份（按 res 记）。
+ */
+/**
+ * 一帧正在等发送缓冲区。
+ *
+ * `since`：它从什么时候开始等。看门狗量的就是这个 —— **一帧等在发送缓冲区里
+ * 多久了**。客户端读了，这一帧就出去了，计时归零；客户端不读，它就一直等着，
+ * 等到上限就断开。
+ *
+ * 不能拿「帧与帧之间多久没有新帧」来量：那是**上游**在想（推理模型会安静
+ * 几十秒），跟客户端读不读没有关系。拿它当判据，一个 thinking 的上游就会把
+ * 好好一个客户端踢掉，答复也断了（2026-11-02，作者复查发现）。
+ */
+interface PendingWrite {
+  /** 从什么时候开始等。 */
+  since: number;
+  /** 「这一帧写完了」的回调：放掉那个 await。 */
+  finish: () => void;
+}
+
+/**
+ * 一条答复的状态：客户端还在不在。
+ *
+ * 每一段答复一份（按 res 记）。
+ */
+interface ReplyState {
+  /** 客户端真的走了（连接断了，或写失败了）。 */
+  gone: boolean;
+  /**
+   * 正在等的那些帧。
+   *
+   * 是个**集合**，不是一个时刻：ping 与正文帧可能同时在等（ping 是定时发的，
+   * 不等人）。一个时刻只能记一个 —— 后来的把前面的盖掉，前面的那一行 await
+   * 就永远挂着（2026-11-02，作者复查发现）。
+   */
+  pending: Set<PendingWrite>;
+  /** 看门狗。 */
+  timer: NodeJS.Timeout | null;
+  /** 客户端走了的时候要叫的东西：停上游。 */
+  onGone?: () => void;
+  /** 「客户端走了」这件事报过了没有（同一件事只报一次）。 */
+  goneReported: boolean;
+}
+
+const replyStates = new WeakMap<NodeJS.EventEmitter, ReplyState>();
+
+/** 这一段答复的状态（没有就建一个）。 */
+function replyState(ctx: Koa.Context): ReplyState {
+  const res = ctx.res;
+  let state = replyStates.get(res);
+  if (!state) {
+    state = { gone: false, pending: new Set(), timer: null, goneReported: false };
+    replyStates.set(res, state);
+    // 连接随时可能报错，而 Node 的「事件没有监听器」就是一次未捕获异常 ——
+    // 整个进程没了。所以这里常驻一个监听器：它只是把「客户端走了」记下来。
+    res.on("error", () => {
+      markGone(ctx, state!);
+    });
+    // 连接断了（客户端走了）：也是「客户端走了」。上游在想的时候没有帧在写，
+    // 这时才知道客户端已经走了 —— 不然网关会一直读上游、一直计费，直到下一
+    // 帧到来才发现。
+    res.on("close", () => {
+      markGone(ctx, state!);
+    });
+    // 连接可能在我们挂上监听器**之前**就断了 —— 那个事件已经发过了，谁也没
+    // 听见。那就当它已经走了（2026-11-03，作者复查发现：客户端在网关挂上
+    // 监听器之前断开，这一段就没人管了）。
+    if (res.destroyed) markGone(ctx, state!);
+  }
+  return state;
+}
+
+/**
+ * 看门狗：一帧在发送缓冲区里等太久了就断开这个连接。
+ *
+ * 只在**有帧在等**的时候才计时。没有帧在等（上游在想）就没有客户端读不读
+ * 这回事 —— 那时候断开只会把一条好好的答复砍掉。
+ *
+ * 期限是「最早那一帧开始等的时刻 + 上限」，**不是**「从现在起算」：新的帧
+ * 不该把已经等着的那些帧的期限往后推（2026-11-02，作者复查发现：ping 每
+ * 5 秒一发，一推就永远推不到，看门狗等于没有）。
+ */
+function armWatchdog(ctx: Koa.Context, state: ReplyState): void {
+  if (state.timer) {
+    clearTimeout(state.timer);
+    state.timer = null;
+  }
+  if (!state.pending.size) return;
+  let earliest = Infinity;
+  for (const write of state.pending) earliest = Math.min(earliest, write.since);
+  const deadline = earliest + drainTimeoutMs();
+  const wait = Math.max(0, deadline - Date.now());
+  const res = ctx.res;
+  state.timer = setTimeout(() => {
+    state.timer = null;
+    // 答复已经写完了：没什么可断的。
+    if (res.writableEnded || res.destroyed) return;
+    // 那些帧都出去了：没有在等的了。
+    if (!state.pending.size) return;
+    const left = deadline - Date.now();
+    if (left > 0) {
+      // 还没到期限：接着等。
+      armWatchdog(ctx, state);
+      return;
+    }
+    console.warn(`[DELIVER] 客户端 ${((Date.now() - earliest) / 1000).toFixed(1)}s 没有读，断开连接`);
+    markGone(ctx, state);
+  }, wait);
+  // 这个定时器不该让进程活着。
+  state.timer.unref?.();
+}
+
+/** 客户端走了：记下来，放掉在等的那些帧，并且叫那个「停上游」的钩子。 */
+function markGone(ctx: Koa.Context, state: ReplyState): void {
+  if (state.gone) return;
+  state.gone = true;
+  if (state.timer) {
+    clearTimeout(state.timer);
+    state.timer = null;
+  }
+  // 那些帧还在等：放掉它们。socket 已经没了，Node 不会再回调那些写 —— 不放
+  // 的话，那几行 await 就永远挂着（2026-11-02，作者复查发现）。
+  for (const write of [...state.pending]) {
+    state.pending.delete(write);
+    try {
+      write.finish();
+    } catch {
+      /* 放掉失败不影响答复 */
+    }
+  }
+  // 真的断开这个连接：只是「不再写了」，socket 与它那几十兆的缓冲还挂着。
   try {
-    return ctx.res.write(chunk);
+    if (!ctx.res.writableEnded) ctx.res.destroy();
   } catch {
+    /* 已经断了 */
+  }
+  try {
+    state.onGone?.();
+  } catch {
+    /* 停上游失败不许影响答复 */
+  }
+}
+
+/**
+ * Write a frame, and say whether the client is still there.
+ *
+ * `res.write()` 返回 false 的意思是「发送缓冲区满了，该等 drain 了」——
+ * **不是**「客户端走了」。把 false 当成「客户端没了」，长答复就会被砍在
+ * 中间：客户端只是读得慢（Claude Code 在渲染长输出时就会慢），窗口满了，
+ * 网关以为对方不要了，直接 break 掉循环。
+ *
+ * 后果是客户端收到一条断掉的流：HTTP 200，拿到部分正文，没有收尾帧
+ * （message_delta / message_stop / [DONE]）。Claude Code 那侧记成
+ * `stream_truncated` + `truncatedAfterOutput`，代理那侧记成
+ * `output_estimated=1`（usage 没等到，只能估算）。
+ *
+ * 所以这里分两件事：
+ *   · 缓冲区满了 → 等这一帧真的发出去（`res.write(chunk, cb)` 的回调），
+ *     等不到就由看门狗断开，不把请求永远吊着；
+ *   · 连接真的断了（res destroyed / writableEnded）→ 才算客户端没了。
+ */
+async function writeFrame(ctx: Koa.Context, chunk: string | Uint8Array): Promise<boolean> {
+  const res = ctx.res;
+  const state = replyState(ctx);
+  if (state.gone || res.writableEnded || res.destroyed) return false;
+  // 看门狗在**写之前**就上膛：这一帧可能永远发不出去（客户端不读，缓冲区
+  // 满了），那时这一行代码就卡在这里 —— 没有看门狗，这条请求就永远吊着。
+  let settled = false;
+  const write: PendingWrite = {
+    since: Date.now(),
+    finish: () => {
+      if (settled) return;
+      settled = true;
+      resolveWrite();
+    },
+  };
+  let resolveWrite: () => void = () => {};
+  state.pending.add(write);
+  armWatchdog(ctx, state);
+  try {
+    await new Promise<void>((resolve) => {
+      resolveWrite = resolve;
+      // 写回调在这一帧真的发出去时才来：缓冲满了它就等着，正是要的。
+      // 写失败了就是客户端没了（socket 断了）。
+      res.write(chunk, (err?: Error | null) => {
+        if (err) markGone(ctx, state);
+        write.finish();
+      });
+    });
+  } catch {
+    state.pending.delete(write);
     return false;
   }
+  // 这一帧出去了（或者失败了）：不在等的名单里了。
+  state.pending.delete(write);
+  if (!state.pending.size && state.timer) {
+    clearTimeout(state.timer);
+    state.timer = null;
+  } else {
+    // 还有别的在等：看门狗按最早那一帧重算。
+    armWatchdog(ctx, state);
+  }
+  if (state.gone) return false;
+  return !(res.writableEnded || res.destroyed);
+}
+
+/**
+ * 客户端走了：上游也别接着算了。
+ *
+ * 上游还在吐字（还在计费），账号还占着 —— 客户端都不要了，接着算就是白花钱。
+ * 所以把上游的流取消掉。取消不了就算了（上游自己会超时）。
+ *
+ * `abort` 是给那些**正在读**这条流的那个循环的：它正卡在 read() 上，取消一
+ * 个被锁住的流没有用，得让它自己停下来。
+ */
+async function stopUpstream(
+  body: ReadableStream<Uint8Array> | null | undefined,
+  abort?: AbortController,
+): Promise<void> {
+  abort?.abort();
+  if (!body) return;
+  try {
+    await body.cancel("the client went away");
+  } catch {
+    /* 已经结束了，或者本来就是关着的 */
+  }
+}
+
+/**
+ * 装上「客户端走了就停上游」这个钩子。
+ *
+ * 看门狗断开连接的时候也会走这条路：客户端不读了，上游就别接着算。
+ *
+ * 客户端要是**已经**走了（在装这个钩子之前就走了），当场把上游停掉 —— 不然
+ * 没人再叫它一次，上游就白算到它自己结束（2026-11-03，作者复查发现）。
+ */
+function onClientGone(ctx: Koa.Context, body: ReadableStream<Uint8Array> | null | undefined, abort?: AbortController): void {
+  const state = replyState(ctx);
+  const stop = () => {
+    void stopUpstream(body, abort);
+  };
+  state.onGone = stop;
+  if (state.gone) stop();
+}
+
+/**
+ * 装上「客户端走了就停上游」这个钩子（上游被 tee 成了两支的情况）。
+ *
+ * tee 的两条支线**都要取消**，源头才会停：取消其中一条，另一条还在读，源头
+ * 就还在吐字（还在计费）。所以这里取消两条。
+ */function onClientGoneTee(
+  ctx: Koa.Context,
+  branches: ReadableStream<Uint8Array>[],
+  abort?: AbortController,
+): void {
+  const state = replyState(ctx);
+  state.onGone = () => {
+    abort?.abort();
+    for (const branch of branches) {
+      void branch.cancel("the client went away").catch(() => {
+        /* 已经结束了 */
+      });
+    }
+  };
 }
 
 /**
@@ -101,7 +384,26 @@ function looksLikeErrorPayload(head: string): boolean {
   if (typeof parsed.errorCode === "number" && parsed.errorCode !== 0) return true;
   if (typeof parsed.error_code === "string") return true;
   if (typeof parsed.error_code === "number" && parsed.error_code !== 0) return true;
+  // A top-level business code: { code: 11128, msg: "...", displayMsg: {...} }.
+  // That is the shape WorkBuddy's channel check answers with (recorded in
+  // test/fixtures/workbuddy-channel-check-11128.json). Without this the 200
+  // path sees a body with no "error" key and calls it a good answer — the
+  // client gets an empty stream and the log shows a success.
+  //
+  // Zero means no error (that is what the platforms answer on success), and
+  // so does a body that carries an answer (choices/object): those are the
+  // normal frames, not envelopes.
+  if (looksLikeBusinessErrorEnvelope(parsed)) return true;
   return false;
+}
+
+/**
+ * Is this the upstream's error envelope rather than an answer?
+ *
+ * An envelope has a business code that is not zero, and no answer in it.
+ */
+function looksLikeBusinessErrorEnvelope(parsed: any): boolean {
+  return isBusinessErrorEnvelope(parsed);
 }
 
 /**
@@ -112,6 +414,19 @@ function looksLikeErrorPayload(head: string): boolean {
  * only read for one sentence, so 8KB is enough; some upstreams answer an
  * error with the whole response body.
  */
+/**
+ * 取消一个 reader：上游那条流就停了（还在吐字就是在计费）。
+ *
+ * 取消失败不算错：上游可能自己已经结束了。
+ */
+async function cancelReader(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
+  try {
+    await reader.cancel("the client went away");
+  } catch {
+    /* 已经结束了 */
+  }
+}
+
 async function drainText(reader: ReadableStreamDefaultReader<Uint8Array>, head: string): Promise<string> {
   const decoder = new TextDecoder();
   let text = head;
@@ -146,9 +461,23 @@ async function drainText(reader: ReadableStreamDefaultReader<Uint8Array>, head: 
  * a 429 body). If the headers were already sent there is no way to turn that
  * into a proper status code, so the check happens first.
  */
-export async function peekStream(body: ReadableStream<Uint8Array>): Promise<ReadableStream<Uint8Array>> {
+export async function peekStream(
+  body: ReadableStream<Uint8Array>,
+  signal?: AbortSignal,
+): Promise<ReadableStream<Uint8Array>> {
   const reader = body.getReader();
-  const first = await reader.read();
+  let first: { done: boolean; value?: Uint8Array };
+  try {
+    first = await readOrAbort(reader, signal);
+  } catch (e) {
+    await cancelReader(reader);
+    throw e;
+  }
+  if (signal?.aborted) {
+    // 客户端在上游的第一帧之前就走了：这条流不该接着算（还在计费）。
+    await cancelReader(reader);
+    throw new ClientGoneError();
+  }
   if (first.done) {
     reader.releaseLock();
     return body;
@@ -164,11 +493,24 @@ export async function peekStream(body: ReadableStream<Uint8Array>): Promise<Read
     if (parsed) {
       const detail = parsed?.error ?? parsed;
       // An empty sentence is no sentence: fall back to the raw body.
-      const words = typeof detail === "string" ? detail : detail?.message || parsed?.message;
+      // `msg` 是平台自己说的那句（WorkBuddy 的渠道校验就是它），`message` 是
+      // 另一种写法。两个都看。
+      const words =
+        typeof detail === "string"
+          ? detail
+          : detail?.message || detail?.msg || parsed?.message || parsed?.msg;
       if (typeof words === "string" && words) said = words;
     }
-    console.warn("[DELIVER] 上游在正文里报错：" + said.slice(0, 200));
-    throw new AuthError("upstream rejected the request", said, 502);
+    console.warn("[DELIVER] 上游在正文里报错：" + scrubForLog(said, 200));
+    // 上游有时用 200 回一个错（渠道校验就是）。码要带上，否则日志里看不见
+    // 11128：状态码说的是 200，看着像成功。
+    //
+    // 码从**解析出来的那个 payload** 里读，不是从正文里再 parse 一次：正文
+    // 可能带着 `data:` 前缀（SSE 的一帧），直接 parse 整个正文会失败。
+    const error = new AuthError("upstream rejected the request", said, 502);
+    const code = businessCodeOfPayload(parsed);
+    if (code !== null) withBusinessCode(error, code);
+    throw error;
   }
   return new ReadableStream<Uint8Array>({
     start(controller) {
@@ -269,25 +611,68 @@ export async function deliverOpenAIStream(
   onUsage?: (usage: any) => void,
   onFailure?: (error: unknown) => void,
 ): Promise<void> {
-  const upstream = await peekStream(body);
+  // 客户端走了的时候，这个信号让读上游的那个循环停下来。
+  const abort = new AbortController();
+  // **先**把「客户端走了」这件事听上，再去等上游的第一帧。
+  //
+  // 推理模型的第一帧可能要等几十秒。这段时间里客户端按了取消（连接断了）：
+  // 之前没人听这件事 —— 上游接着算，账号照付这几十秒，客户端一个字没拿到
+  // （2026-11-03，作者复查发现）。
+  const state = replyState(ctx);
+  state.onGone = () => abort.abort();
+  // 客户端在挂上监听器之前就走了：那个事件没人听见。这里补一次。
+  if (state.gone) abort.abort();
   ctx.res.setHeader("x-request-id", rid("req_"));
   takeOver(ctx);
   sseHead(ctx);
+  let upstream: ReadableStream<Uint8Array>;
+  try {
+    upstream = await peekStream(body, abort.signal);
+  } catch (e) {
+    if (e instanceof ClientGoneError) {
+      reportClientGone(ctx, onFailure);
+      ctx.res.end();
+      return;
+    }
+    throw e;
+  }
+  // 看门狗断开连接时（客户端不读了）也要停上游：它还在吐字就是在计费。
+  onClientGone(ctx, upstream, abort);
   if (dialect === "openai") {
-    await pipeOpenAIChunks(upstream, ctx, onFinish, onUsage, model, onFailure);
+    await pipeOpenAIChunks(upstream, ctx, onFinish, onUsage, model, onFailure, abort);
     return;
   }
   try {
-    for await (const chunk of openaiStreamToAnthropic(watchFinish(readOpenAIChunks(upstream), onFinish, onUsage), model)) {
-      if (!writeSafe(ctx, chunk)) break;
+    for await (const chunk of openaiStreamToAnthropic(watchFinish(readOpenAIChunks(upstream, abort.signal), onFinish, onUsage), model)) {
+      if (!(await writeFrame(ctx, chunk))) {
+        // 客户端走了：上游也别接着算（还在计费），这一条也不该记成成功。
+        await stopUpstream(upstream, abort);
+        reportClientGone(ctx, onFailure);
+        break;
+      }
     }
+    // 上游安静的时候客户端断开：这条请求不算成功（客户端一个字都没拿到）。
+    reportClientGone(ctx, onFailure);
   } catch (e) {
     // The headers are already out, so the failure goes back as an error event.
     console.warn(`[DELIVER] 发给客户端的错误事件：${failureLine(e)}`);
-    writeSafe(ctx, errorEvent((e as Error)?.message));
+    await writeFrame(ctx, errorEvent((e as Error)?.message));
     reportFailure(onFailure, e);
   }
   ctx.res.end();
+}
+
+/**
+ * 客户端走了（连接断了，或者它不读了，被看门狗断开）。
+ *
+ * 这不是上游的错：账号没有问题，答复只是没人要。所以它不带上游状态，也不带
+ * 业务码 —— 分类器会把它算成「不可降级」，账号不会被记冷却。
+ */
+export class ClientGoneError extends Error {
+  constructor() {
+    super("the client went away before the answer was finished");
+    this.name = "ClientGoneError";
+  }
 }
 
 /** A stream of Anthropic bytes. */
@@ -303,6 +688,8 @@ export async function deliverAnthropicStream(
   ctx.res.setHeader("x-request-id", rid("req_"));
   takeOver(ctx);
   sseHead(ctx);
+  // 客户端走了的时候，这个信号让读上游的那个循环停下来。
+  const abort = new AbortController();
   if (dialect === "anthropic") {
     // The bytes go to the client as they are, apart from one thing: the
     // message_start frame names the model, and it has to name the one the
@@ -313,9 +700,12 @@ export async function deliverAnthropicStream(
     // tokens in message_start and the output tokens in message_delta, and
     // nobody reads those unless someone parses them.
     const [toClient, toParser] = body.tee();
-    void (async () => {
+    // 看门狗断开连接时（客户端不读了）也要停上游：它还在吐字就是在计费。
+    // tee 的两条支线都要取消，源头才停（取消一条，另一条还在读）。
+    onClientGoneTee(ctx, [toClient, toParser], abort);
+    const parsing = (async () => {
       try {
-        for await (const event of readSseEvents(toParser)) {
+        for await (const event of readSseEvents(toParser, abort.signal)) {
           const json = parseLooseJson(event.data);
           if (onUsage && json?.usage) onUsage(json.usage);
         }
@@ -323,16 +713,27 @@ export async function deliverAnthropicStream(
         // The usage is a nice-to-have; the answer itself is what matters.
       }
     })();
-    await writeAnthropicFrames(toClient, ctx, model, pingMs, onFailure);
+    await writeAnthropicFrames(toClient, ctx, model, pingMs, onFailure, abort);
+    // 等那条支线也收工：它不收，tee 的源头就还在吐字（还在计费）。
+    await parsing;
     return;
   }
+  // 看门狗断开连接时（客户端不读了）也要停上游：它还在吐字就是在计费。
+  onClientGone(ctx, body, abort);
   try {
-    for await (const chunk of anthropicStreamToOpenAI(body, model, onUsage)) {
-      if (!writeSafe(ctx, chunk)) break;
+    for await (const chunk of anthropicStreamToOpenAI(body, model, onUsage, abort.signal)) {
+      if (!(await writeFrame(ctx, chunk))) {
+        // 客户端走了：上游也别接着算（还在计费），这一条也不该记成成功。
+        await stopUpstream(body, abort);
+        reportClientGone(ctx, onFailure);
+        break;
+      }
     }
+    // 上游安静的时候客户端断开：这条请求不算成功。
+    reportClientGone(ctx, onFailure);
   } catch (e) {
     console.warn(`[DELIVER] 发给客户端的错误事件：${failureLine(e)}`);
-    writeSafe(ctx, errorEvent((e as Error)?.message));
+    await writeFrame(ctx, errorEvent((e as Error)?.message));
     reportFailure(onFailure, e);
   }
   ctx.res.end();
@@ -353,6 +754,23 @@ function reportFailure(onFailure: ((error: unknown) => void) | undefined, error:
   }
 }
 
+/**
+ * 客户端走了：这条请求不算成功，报给调用方。
+ *
+ * 只报一次：同一个事件有两条路会碰到它（写帧发现客户端没了、上游的流结束
+ * 之后回头一看客户端已经没了）。
+ *
+ * 为什么非报不可：客户端走了但这条请求被记成成功，日志就与事实相反 —— 用量
+ * 走的是估算，账号的冷却被清掉，而实际上客户端一个字都没拿到（2026-11-03，
+ * 作者复查发现：上游安静的时候客户端断开，两条路上只有一条报了失败）。
+ */
+function reportClientGone(ctx: Koa.Context, onFailure?: (error: unknown) => void): void {
+  const state = replyState(ctx);
+  if (!state.gone || state.goneReported) return;
+  state.goneReported = true;
+  reportFailure(onFailure, new ClientGoneError());
+}
+
 /** A stream of OpenAI chunks that are already parsed (the legacy protocol). */
 export async function deliverOpenAIChunks(
   ctx: Koa.Context,
@@ -370,12 +788,17 @@ export async function deliverOpenAIChunks(
       for await (const chunk of chunks) {
         if (chunk?.usage && onUsage) onUsage(chunk.usage);
         if (model && chunk && typeof chunk === "object") chunk.model = model;
-        if (!writeSafe(ctx, sseData(chunk))) break;
+        if (!(await writeFrame(ctx, sseData(chunk)))) {
+          reportClientGone(ctx, onFailure);
+          break;
+        }
       }
-      writeSafe(ctx, SSE_DONE);
+      // 上游安静的时候客户端断开：这条请求不算成功。
+      reportClientGone(ctx, onFailure);
+      await writeFrame(ctx, SSE_DONE);
     } catch (e) {
       console.warn(`[DELIVER] 发给客户端的错误事件：${failureLine(e)}`);
-      writeSafe(ctx, errorEvent((e as Error)?.message));
+      await writeFrame(ctx, errorEvent((e as Error)?.message));
       reportFailure(onFailure, e);
     }
     ctx.res.end();
@@ -383,11 +806,16 @@ export async function deliverOpenAIChunks(
   }
   try {
     for await (const chunk of openaiStreamToAnthropic(chunks, model)) {
-      if (!writeSafe(ctx, chunk)) break;
+      if (!(await writeFrame(ctx, chunk))) {
+        reportClientGone(ctx, onFailure);
+        break;
+      }
     }
+    // 上游安静的时候客户端断开：这条请求不算成功。
+    reportClientGone(ctx, onFailure);
   } catch (e) {
     console.warn(`[DELIVER] 发给客户端的错误事件：${failureLine(e)}`);
-    writeSafe(ctx, errorEvent((e as Error)?.message));
+    await writeFrame(ctx, errorEvent((e as Error)?.message));
     reportFailure(onFailure, e);
   }
   ctx.res.end();
@@ -440,17 +868,26 @@ async function pipeOpenAIChunks(
   onUsage?: (usage: any) => void,
   model?: string,
   onFailure?: (error: unknown) => void,
+  abort?: AbortController,
 ): Promise<void> {
   try {
-    for await (const chunk of watchFinish(readOpenAIChunks(body), onFinish, onUsage)) {
+    for await (const chunk of watchFinish(readOpenAIChunks(body, abort?.signal), onFinish, onUsage)) {
       if (model && chunk && typeof chunk === "object") chunk.model = model;
-      if (!writeSafe(ctx, sseData(chunk))) break;
+      if (!(await writeFrame(ctx, sseData(chunk)))) {
+        // 客户端走了：上游也别接着算（还在计费），这一条也不该记成成功。
+        await stopUpstream(body, abort);
+        reportClientGone(ctx, onFailure);
+        break;
+      }
     }
-    writeSafe(ctx, SSE_DONE);
+    // 上游的流结束了，但客户端可能早就走了（上游安静的时候它断开的）：那
+    // 这一条不是成功 —— 客户端一个字都没拿到（2026-11-03，作者复查发现）。
+    reportClientGone(ctx, onFailure);
+    await writeFrame(ctx, SSE_DONE);
   } catch (e) {
     console.warn(`[DELIVER] 发给客户端的错误事件：${failureLine(e)}`);
-    writeSafe(ctx, sseData({ error: { type: "api_error", message: (e as Error)?.message ?? "upstream failed" } }));
-    writeSafe(ctx, SSE_DONE);
+    await writeFrame(ctx, sseData({ error: { type: "api_error", message: (e as Error)?.message ?? "upstream failed" } }));
+    await writeFrame(ctx, SSE_DONE);
     reportFailure(onFailure, e);
   } finally {
     // The response has to end, or the client waits for a connection that never
@@ -484,19 +921,34 @@ async function writeAnthropicFrames(
   model: string,
   pingMs = 0,
   onFailure?: (error: unknown) => void,
+  abort?: AbortController,
 ): Promise<void> {
   let lastActivity = Date.now();
   let warnedMissingMessage = false;
+  // ping 也要认背压：客户端读得慢时，ping 不能自己把缓冲区填满，也不能
+  // 因为「写不进去」而把整条流砍了。
+  //
+  // 它也不能有权把一条正在前进的连接掐掉：ping 走的是同一个看门狗，而看门狗
+  // 量的是「最早那一帧等了多久」—— ping 每 5 秒一发（不等前面那帧发出去），
+  // 所以它不能把期限往后推（2026-11-02，作者复查发现：ping 一推，看门狗就
+  // 永远等不到那个上限，等于没有）。
+  //
+  // 所以 ping 自己排队：上一帧 ping 还在等，就不再发新的。
+  let pingPending = false;
   const writePing = () => {
     if (ctx.res.writableEnded || ctx.res.destroyed) return;
+    if (pingPending) return;
     if (Date.now() - lastActivity < pingMs) return;
-    if (!writeSafe(ctx, 'event: ping\ndata: {"type":"ping"}\n\n')) return;
-    lastActivity = Date.now();
+    pingPending = true;
+    void writeFrame(ctx, 'event: ping\ndata: {"type":"ping"}\n\n').then((ok) => {
+      pingPending = false;
+      if (ok) lastActivity = Date.now();
+    });
   };
   const pingTimer = pingMs > 0 ? setInterval(writePing, Math.min(pingMs, 5000)) : null;
   pingTimer?.unref?.();
   try {
-    for await (const event of readSseEvents(body)) {
+    for await (const event of readSseEvents(body, abort?.signal)) {
       let data = event.data;
       if (event.event === "message_start" || (!event.event && data.includes('"message_start"'))) {
         const json = parseLooseJson(data);
@@ -510,12 +962,20 @@ async function writeAnthropicFrames(
         }
       }
       const frame = event.event ? `event: ${event.event}\ndata: ${data}\n\n` : `data: ${data}\n\n`;
-      if (!writeSafe(ctx, frame)) break;
+      if (!(await writeFrame(ctx, frame))) {
+        // 客户端走了：上游也别接着算（还在计费），这一条也不该记成成功。
+        await stopUpstream(body, abort);
+        reportClientGone(ctx, onFailure);
+        break;
+      }
       lastActivity = Date.now();
     }
+    // 上游安静的时候客户端断开：上游的流到这里才结束。不报的话，这条请求
+    // 会被记成成功 —— 客户端其实一个字都没拿到（2026-11-03，作者复查发现）。
+    reportClientGone(ctx, onFailure);
   } catch (e) {
     console.warn(`[DELIVER] 发给客户端的错误事件：${failureLine(e)}`);
-    writeSafe(ctx, errorEvent((e as Error)?.message));
+    await writeFrame(ctx, errorEvent((e as Error)?.message));
     reportFailure(onFailure, e);
   } finally {
     if (pingTimer) clearInterval(pingTimer);
@@ -553,6 +1013,18 @@ function retryAfterHeaders(e: unknown): Record<string, string> {
 export function sendError(ctx: Koa.Context, e: unknown, headers: Record<string, string> = {}): void {
   const err = e as AuthError;
   const extra = { ...retryAfterHeaders(e), ...headers };
+  if (e instanceof ClientGoneError) {
+    // 客户端已经走了：这个答复没人收。日志别写成「上游挂了」—— 上游没坏，
+    // 只是没人要了（2026-11-03）。
+    console.log(`[DELIVER] 客户端走了，答复没送出去`);
+    if (ctx.res.headersSent) {
+      ctx.res.end();
+      return;
+    }
+    ctx.status = 499;
+    ctx.body = { error: { type: "api_error", message: "the client went away" } };
+    return;
+  }
   if (e instanceof LimitError) {
     if (ctx.res.headersSent) {
       ctx.res.end();

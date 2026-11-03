@@ -15,11 +15,20 @@
 //     back into a single chat.completion object here.
 //   * A failure can arrive as HTTP 200 with an error object in the body. The
 //     gateway has to look, or the agent sees an empty answer.
+//
+// And one that keeps the request alive: the upstream's channel check reads the
+// opening line of the system prompt and refuses a request that names another
+// client (see lib/workbuddy/identity.ts).
 
 import type { Json } from "../json.ts";
 import { createHash } from "node:crypto";
 import { AuthError } from "../credential.ts";
-import { withCooldownUntil, withUpstreamStatus, retryAfterMs } from "../upstream-status.ts";
+import { withCooldownUntil, withUpstreamStatus, withBusinessCode, retryAfterMs } from "../upstream-status.ts";
+import { DEFAULT_SYSTEM, rewriteSystemContent } from "./identity.ts";
+import { logCredentialRejection, logUpstreamBody, logUpstreamPayload } from "./upstream-log.ts";
+import { businessCodeOfBody } from "../upstream-status.ts";
+import { businessCodeOfPayload, isBusinessErrorEnvelope } from "../upstream-status.ts";
+import { ClientGoneError } from "../router/deliver.ts";
 import {
   chatBase,
   chatHeaders,
@@ -42,6 +51,12 @@ export interface WorkBuddyChatOptions {
   conversationId?: string;
   /** The model, so the body can be built the way the simulated client builds it. */
   model?: WorkBuddyModel | null;
+  /**
+   * The client gave up: stop asking the upstream.
+   *
+   * 上游还在算就是在计费，账号还占着。客户端都不要答复了，接着算就是白花钱。
+   */
+  signal?: AbortSignal;
 }
 
 export interface WorkBuddyChat {
@@ -62,9 +77,18 @@ export function buildChatBody(
   model?: WorkBuddyModel | null,
 ): Json {
   const out: Json = { ...body };
-  const messages = Array.isArray(out.messages) ? out.messages : [];
+  // 数组是复制出来的：同一个 body 会依次交给好几个上游（主路由模型可以有
+  // 多个目标），就地改了会把这一处的改写漏给下一个上游。
+  const messages: Json[] = Array.isArray(out.messages) ? [...(out.messages as Json[])] : [];
   if (!messages.length || messages[0]?.role !== "system") {
-    out.messages = [{ role: "system", content: "You are a helpful assistant." }, ...messages];
+    out.messages = [{ role: "system", content: DEFAULT_SYSTEM }, ...messages];
+  } else {
+    // 上游的渠道校验认的是系统提示词开头那句自报家门（见 identity.ts）。
+    const head = messages[0];
+    if (head && typeof head === "object") {
+      messages[0] = { ...(head as object), content: rewriteSystemContent((head as { content?: unknown }).content) };
+    }
+    out.messages = messages;
   }
   out.stream = true;
   if (!out.stream_options) out.stream_options = { include_usage: true };
@@ -192,6 +216,7 @@ export async function workbuddyChat(
 
   const payload = buildChatBody(body, opts.model ?? null);
   const url = `${chatBase(session)}${CHAT_PATH}`;
+  logUpstreamPayload(payload);
 
   for (let attempt = 1; ; attempt++) {
     const headers = chatHeaders(session, { conversationId: opts.conversationId });
@@ -201,9 +226,14 @@ export async function workbuddyChat(
         method: "POST",
         headers,
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(TIMEOUT_MS),
+        // 客户端走了就把这一条也停掉：上游还在算就是在计费。
+        signal: opts.signal
+          ? AbortSignal.any([opts.signal, AbortSignal.timeout(TIMEOUT_MS)])
+          : AbortSignal.timeout(TIMEOUT_MS),
       });
     } catch (e) {
+      // 客户端走了：这不是上游的错，别再试、也别记成账号的错。
+      if (opts.signal?.aborted) throw new ClientGoneError();
       if (attempt < MAX_ATTEMPTS) {
         await backoff(attempt);
         continue;
@@ -217,6 +247,8 @@ export async function workbuddyChat(
 
     if (res.status === 401 || res.status === 403) {
       const detail = await res.text().catch(() => "");
+      // 正文里可能有账号标识，不进 stdout；走凭据日志（数据卷里的 auth.log）。
+      logCredentialRejection(res.status, providerId, detail);
       // 平台拒了这个令牌：这里不换令牌（换令牌是定时器的事，它临期就换）。
       // 换个说法报出去。
       throw withUpstreamStatus(
@@ -244,6 +276,7 @@ export async function workbuddyChat(
         ),
         res.status,
       );
+      logUpstreamBody(res.status, detail);
       // 上游说的「过多久再试」：冷却到那时候为止（路由层看这个，不自己猜）。
       const wait = retryAfterMs(res);
       if (wait !== null) withCooldownUntil(error, Date.now() + wait);
@@ -252,10 +285,11 @@ export async function workbuddyChat(
 
     if (res.status >= 400) {
       const detail = await res.text().catch(() => "");
+      logUpstreamBody(res.status, detail);
       // The client sees the gateway's status; the upstream's own status says
       // whether another account would do better (a 400 is the request's fault,
       // and every account would fail the same way).
-      throw withUpstreamStatus(
+      const error = withUpstreamStatus(
         new AuthError(
           `upstream error (HTTP ${res.status})`,
           detail.slice(0, 300) || `WorkBuddy 返回了 HTTP ${res.status}`,
@@ -263,6 +297,10 @@ export async function workbuddyChat(
         ),
         res.status,
       );
+      // 渠道校验是 11128，日志里要能一眼看出是风控，不是参数写错。
+      const code = businessCodeOfBody(detail);
+      if (code !== null) withBusinessCode(error, code);
+      throw error;
     }
 
     return { response: res, session };
@@ -325,7 +363,7 @@ export async function fetchWorkBuddyCatalog(
 }
 
 /** Fold an upstream stream into one chat.completion object. */
-export async function aggregateStream(response: Response, model: string): Promise<any> {
+export async function aggregateStream(response: Response, model: string, signal?: AbortSignal): Promise<any> {
   const content: string[] = [];
   const reasoning: string[] = [];
   const toolCalls = new Map<number, { id: string; type: string; function: { name: string; arguments: string } }>();
@@ -334,37 +372,57 @@ export async function aggregateStream(response: Response, model: string): Promis
   let finish = "stop";
 
   if (response.body) {
-    for await (const chunk of readOpenAIChunks(response.body)) {
-      if (!chunk) continue;
-      // A failure can arrive as a normal frame with an error in it. The
-      // official client reads the body and classifies the error; without that
-      // the agent sees an empty answer and no reason.
-      if (chunk.error) {
-        const error = chunk.error as any;
-        throw new AuthError(
-          `upstream error (${error.code ?? error.type ?? "unknown"})`,
-          typeof error.message === "string" ? error.message : JSON.stringify(error).slice(0, 300),
-          502,
-        );
-      }
-      if (chunk.id) id = chunk.id;
-      if (chunk.usage) usage = chunk.usage;
-      for (const choice of chunk.choices ?? []) {
-        const delta = choice.delta ?? {};
-        if (typeof delta.content === "string") content.push(delta.content);
-        if (typeof delta.reasoning_content === "string") reasoning.push(delta.reasoning_content);
-        if (choice.finish_reason) finish = choice.finish_reason;
-        for (const call of delta.tool_calls ?? []) {
-          const index = typeof call.index === "number" ? call.index : toolCalls.size;
-          const entry = toolCalls.get(index) ?? { id: call.id ?? "", type: "function", function: { name: "", arguments: "" } };
-          if (call.id) entry.id = call.id;
-          if (call.type) entry.type = call.type;
-          if (call.function?.name) entry.function.name += call.function.name;
-          if (typeof call.function?.arguments === "string") entry.function.arguments += call.function.arguments;
-          toolCalls.set(index, entry);
+    try {
+      for await (const chunk of readOpenAIChunks(response.body, signal)) {
+        if (!chunk) continue;
+        // A failure can arrive as a normal frame with an error in it. The
+        // official client reads the body and classifies the error; without that
+        // the agent sees an empty answer and no reason.
+        if (chunk.error) {
+          const error = chunk.error as any;
+          throw new AuthError(
+            `upstream error (${error.code ?? error.type ?? "unknown"})`,
+            typeof error.message === "string" ? error.message : JSON.stringify(error).slice(0, 300),
+            502,
+          );
+        }
+        // 上游有时用 200 回一个错（WorkBuddy 的渠道校验就是）：正文里只有业务
+        // 码，没有 error 字段。当成正常的帧的话，客户端收到一个空的 200 答复，
+        // 看着像模型答了个空，理由也没有（2026-11-03，作者复查发现）。
+        if (isBusinessErrorEnvelope(chunk)) {
+          const code = businessCodeOfPayload(chunk) ?? 0;
+          const said = typeof chunk.msg === "string" ? chunk.msg : typeof chunk.message === "string" ? chunk.message : "";
+          throw withBusinessCode(
+            new AuthError(`upstream rejected the request (${code})`, said.slice(0, 300) || "upstream rejected the request", 502),
+            code,
+          );
+        }
+        if (chunk.id) id = chunk.id;
+        if (chunk.usage) usage = chunk.usage;
+        for (const choice of chunk.choices ?? []) {
+          const delta = choice.delta ?? {};
+          if (typeof delta.content === "string") content.push(delta.content);
+          if (typeof delta.reasoning_content === "string") reasoning.push(delta.reasoning_content);
+          if (choice.finish_reason) finish = choice.finish_reason;
+          for (const call of delta.tool_calls ?? []) {
+            const index = typeof call.index === "number" ? call.index : toolCalls.size;
+            const entry = toolCalls.get(index) ?? { id: call.id ?? "", type: "function", function: { name: "", arguments: "" } };
+            if (call.id) entry.id = call.id;
+            if (call.type) entry.type = call.type;
+            if (call.function?.name) entry.function.name += call.function.name;
+            if (typeof call.function?.arguments === "string") entry.function.arguments += call.function.arguments;
+            toolCalls.set(index, entry);
+          }
         }
       }
+    } catch (e) {
+      // 客户端走了：流是我们自己掐掉的，不是上游的错（上游的错要记冷却）。
+      if (signal?.aborted) throw new ClientGoneError();
+      throw e;
     }
+    // 客户端走了：流是空的或者被掐断的，不能当成一份完整的答复送出去 ——
+    // 客户端会收到一个空的 200，而它其实一个字都没拿到。
+    if (signal?.aborted) throw new ClientGoneError();
   }
 
   const message: Json = { role: "assistant", content: content.join("") };

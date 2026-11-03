@@ -398,6 +398,25 @@ console.log("平台自己的业务码");
   check("model_not_available → 不降级", failure.degradable === false, failure.kind);
 }
 
+// 同一个码，写成数字还是写成字符串，分类得一样。
+//
+// WorkBuddy 的渠道校验 11128 就是这么个码：它跟用哪个账号无关，换一个账号
+// 再试必然再错一次。写成字符串的时候要是查不到表，就落回状态码那一条 ——
+// 走 200 那条路时状态是 502，成了「上游挂了」，降级会把另一个账号也烧掉
+// （2026-11-03，作者复查发现）。
+{
+  const asNumber = withBusinessCode(new AuthError("x", "x", 502), 11128);
+  const asString = withBusinessCode(new AuthError("x", "x", 502), "11128");
+  check("11128 → 不降级", classifyUpstreamError(asNumber).degradable === false, classifyUpstreamError(asNumber).kind);
+  check("11128 → request", classifyUpstreamError(asNumber).kind === "request", classifyUpstreamError(asNumber).kind);
+  check(
+    "11128 写成字符串也一样",
+    classifyUpstreamError(asString).degradable === false &&
+      classifyUpstreamError(asString).kind === "request",
+    classifyUpstreamError(asString).kind,
+  );
+}
+
 console.log("");
 console.log("七牛云：模型不在这个 key 的分组里");
 

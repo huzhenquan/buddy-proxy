@@ -190,6 +190,11 @@ const ACCOUNT_CODES: Record<number, string> = {
 const REQUEST_CODES: Record<number, string> = {
   2013: "request", // 参数错误
   2022: "request", // 模型不存在或无权使用
+  // WorkBuddy 的渠道校验：请求不是官方客户端发来的。它认的是**模拟端的
+  // 指纹**，跟哪个账号无关 —— 换一个 WorkBuddy 账号也是这个错，所以不降级、
+  // 不冷却（2026-11-02，作者复查发现：同一个 11128，走 400 那条路是「请求
+  // 本身的问题」，走 200 那条路却成了「上游挂了」，两条路的处理不一样）。
+  11128: "request",
 };
 
 /** The codes the other platforms use, in their own words. */
@@ -322,6 +327,14 @@ function classifyBusinessCode(code: number | string): { degradable: boolean; kin
     const request = REQUEST_CODES[code];
     if (request) return { degradable: false, kind: request };
     return null;
+  }
+  // 码写成字符串的样子（"11128"）也要按数字查一遍：同一个码，两种写法，
+  // 分类得一样。不然它落回状态码那一条 —— 走 200 那条路时状态是 502，
+  // 就成了「上游挂了」，降级会换一个账号再试一次（而这个错跟账号无关，
+  // 必然再错一次）（2026-11-03，作者复查发现）。
+  const asNumber = Number(code.trim());
+  if (Number.isFinite(asNumber) && String(asNumber) === code.trim()) {
+    return classifyBusinessCode(asNumber);
   }
   return NAMED_CODES[code.toLowerCase()] ?? null;
 }

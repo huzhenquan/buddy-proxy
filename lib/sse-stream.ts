@@ -13,7 +13,17 @@ export interface SseEvent {
   data: string;
 }
 
-export async function* readSseEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<SseEvent> {
+/**
+ * Read the SSE events of a stream.
+ *
+ * `signal` 说「别再读了」：客户端走了的时候用它停手。停下来的时候这个 reader
+ * 会被取消（`reader.cancel()`）—— 一条 tee 出来的支线只有被取消了，源头才会
+ * 跟着结束；不然上游还在吐字（还在计费）。
+ */
+export async function* readSseEvents(
+  body: ReadableStream<Uint8Array>,
+  signal?: AbortSignal,
+): AsyncGenerator<SseEvent> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -36,7 +46,7 @@ export async function* readSseEvents(body: ReadableStream<Uint8Array>): AsyncGen
 
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readOrAbort(reader, signal);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let idx: number;
@@ -74,8 +84,50 @@ export async function* readSseEvents(body: ReadableStream<Uint8Array>): AsyncGen
     const ev = take();
     if (ev) yield ev;
   } finally {
+    if (signal?.aborted) {
+      // 停手了：把这条支线取消掉，源头才不会再吐字。
+      try {
+        await reader.cancel("the client went away");
+      } catch {
+        /* 已经结束了 */
+      }
+    }
     reader.releaseLock();
   }
+}
+
+/**
+ * 读一帧，或者「别再读了」先到。
+ *
+ * 没有 signal 时就是普通的读。有 signal 时，两边赛跑：先到的算。
+ */
+export async function readOrAbort(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal?: AbortSignal,
+): Promise<{ done: boolean; value?: Uint8Array }> {
+  if (!signal) {
+    const { done, value } = await reader.read();
+    return { done, value };
+  }
+  if (signal.aborted) return { done: true };
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      resolve({ done: true });
+    };
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    reader.read().then(
+      ({ done, value }) => {
+        cleanup();
+        resolve({ done, value });
+      },
+      (e) => {
+        cleanup();
+        reject(e);
+      },
+    );
+  });
 }
 
 /**
@@ -136,8 +188,11 @@ export function parseLooseJson(text: string): any {
  * empty reply, which looks like a model that thought for a moment and gave up —
  * so it is raised instead.
  */
-export async function* readOpenAIChunks(body: ReadableStream<Uint8Array>): AsyncGenerator<Json> {
-  for await (const ev of readSseEvents(body)) {
+export async function* readOpenAIChunks(
+  body: ReadableStream<Uint8Array>,
+  signal?: AbortSignal,
+): AsyncGenerator<Json> {
+  for await (const ev of readSseEvents(body, signal)) {
     if (!ev.data || ev.data === "[DONE]") continue;
     let chunk: Json;
     try {

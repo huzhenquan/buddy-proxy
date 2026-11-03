@@ -31,6 +31,7 @@ import type { Json } from "../json.ts";
 import { configString } from "../config.ts";
 import crypto from "node:crypto";
 import { AuthError } from "../credential.ts";
+import { scrubForLog } from "../log-scrub.ts";
 import {
   ensureCredential,
   loadSession,
@@ -385,7 +386,7 @@ export async function legacyChatCompletion(
     const text = await r.text().catch(() => "");
     // 正文只放在 hint 里，而日志与用量表都只记 message。上游为什么拒，
     // 只能靠这一行（容器一重建，hint 就没了）。
-    console.warn(`[UPSTREAM] Qoder 老协议上游 ${r.status}：${text.slice(0, 500)}`);
+    console.warn(`[UPSTREAM] Qoder 老协议上游 ${r.status}：${scrubForLog(text, 500)}`);
     throw new AuthError(`legacy upstream HTTP ${r.status}`, `Qoder 老协议返回 ${r.status}：${text.slice(0, 300)}`, 502);
   }
   return r;
@@ -470,6 +471,13 @@ export async function* readLegacyFrames(body: ReadableStream<Uint8Array>): Async
       }
     }
   } finally {
+    // 取消，不只是放开锁：调用方（客户端走了）不再要这条流时，上游还在吐字
+    // （还在计费），账号还占着。取消掉它，源头才停。
+    try {
+      await reader.cancel();
+    } catch {
+      /* 已经结束了 */
+    }
     reader.releaseLock();
   }
 }

@@ -57,14 +57,80 @@ export function upstreamStatusOf(error: unknown): number | null {
   return null;
 }
 
-/** The platform's own code, if the error carries one. */
+/**
+ * The platform's own code, if the error carries one.
+ *
+ * A zero code means "no code": the platforms answer 0 on success, and a body
+ * that carries 0 is not saying anything about a failure.
+ */
 export function businessCodeOf(error: unknown): number | string | null {
   if (!error || typeof error !== "object") return null;
   const err = error as UpstreamBusinessCode & { code?: unknown };
   const value = err.businessCode ?? err.code;
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof value === "number") return Number.isFinite(value) && value !== 0 ? value : null;
+  if (typeof value === "string") {
+    const text = value.trim();
+    return text && text !== "0" ? text : null;
+  }
   return null;
+}
+
+/**
+ * 平台自己的码，从上游的正文里读（如果那里有）。
+ *
+ * 状态码说的是「这个请求被拒了」，业务码说的是「为什么」：风控（WorkBuddy
+ * 的 11128）与参数不认都是 400，换一个账号的结果却不一样，所以码要带上。
+ *
+ * 正文里码的位置不统一：有的在顶层 `code`，有的在 `error.code`。两个都看，
+ * 取第一个有值的。
+ *
+ * 0 不算码：有的平台成功时也回 `code: 0`，把它当成「没有码」。
+ */
+export function businessCodeOfBody(text: string): number | string | null {
+  let parsed: any = null;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    return null;
+  }
+  return businessCodeOfPayload(parsed);
+}
+
+/**
+ * 平台自己的码，从**已经解析出来的**正文里读。
+ *
+ * 正文可能带着 `data:` 前缀（SSE 的一帧），直接 parse 整个正文会失败 ——
+ * 所以这里接的是解析好的那个 payload。
+ *
+ * `error.code` 先看，顶层的 `code` 后看：`error` 里那个是**这个错误**的码，
+ * 顶层那个有时是整个响应的码（成功时是 0）。两个都看，谁有值算谁。
+ */
+export function businessCodeOfPayload(payload: any): number | string | null {
+  for (const value of [payload?.error?.code, payload?.code]) {
+    if (typeof value === "string") {
+      const text = value.trim();
+      // "0" 与 0 一样：没有码。
+      if (text && text !== "0") return text;
+      continue;
+    }
+    if (typeof value === "number" && Number.isFinite(value) && value !== 0) return value;
+  }
+  return null;
+}
+
+/**
+ * 这个正文是不是上游的「错误信封」：只有业务码，没有答复。
+ *
+ * 上游有时用 200 回一个错 —— WorkBuddy 的渠道校验就是（业务码 11128）。当成
+ * 正常的帧的话，客户端收到一个空的 200 答复，看着像模型答了个空，理由也没
+ * 有（2026-11-03，作者复查发现：非流式那条路上没认这种信封）。
+ *
+ * 有答复的正文（`choices` / `object` / `data`）不算：那是正常的帧。
+ */
+export function isBusinessErrorEnvelope(payload: any): boolean {
+  if (!payload || typeof payload !== "object") return false;
+  if (payload.choices || payload.object || payload.data !== undefined) return false;
+  return businessCodeOfPayload(payload) !== null;
 }
 
 /** Keep the moment the account is free again on an error. */
