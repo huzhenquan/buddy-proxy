@@ -19,9 +19,11 @@ import {
 import { qoderChatCompletion, LimitError } from "../../qoder/transport.ts";
 import type { QoderRegion } from "../../qoder/auth.ts";
 import { legacyChatCompletion, readLegacyFrames } from "../../qoder/legacy.ts";
+import { ClientGoneError } from "../deliver.ts";
 import { deliverJson, deliverOpenAIChunks, deliverOpenAIStream, type Dialect } from "../deliver.ts";
 import { platformOf } from "../../platforms.ts";
 import { upstreamModel, type Route } from "../routes.ts";
+import { asClientGone, watchClientGone } from "./client-gone.ts";
 import { type UpstreamContext, settlement, underPolicy } from "./policy.ts";
 
 /**
@@ -79,23 +81,59 @@ export async function toQoder(
   ctx.upstreamMaxTokens = QODER_CLIENT_MAX_TOKENS;
   // 流式答复是在 underPolicy 返回之后才消费的：冷却由调用方在流结束时结算。
   const settle = settlement();
-  const upstream = await underPolicy(
-    route.platform,
-    "qoder",
-    (account) =>
-      qoderWithRetry(
-        () => qoderChatCompletion(openaiBody, { stream, providerId: account.id, region }),
-        ctx.qoderMaxAttempts,
-      ),
-    settle,
-  );
+  // 客户端走了就把上游停掉：上游还在算就是在计费，账号还占着。
+  //
+  // 非流式那条路尤其要紧：答复要等整个上游的答复读完才发出去，客户端在这
+  // 中间走了（超时、按了取消），没人停上游的话它就接着算到超时（2026-11-03，
+  // 作者复查发现）。
+  const watch = watchClientGone(out);
+  let upstream: Response;
+  try {
+    upstream = await underPolicy(
+      route.platform,
+      "qoder",
+      (account) =>
+        qoderWithRetry(
+          () =>
+            qoderChatCompletion(openaiBody, { stream, providerId: account.id, region, signal: watch.signal }).catch((e) => {
+              // 客户端走了不是上游的错：策略看到的是这个，它才不会给账号记冷却。
+              throw asClientGone(e, watch);
+            }),
+          ctx.qoderMaxAttempts,
+        ),
+      settle,
+    );
+  } catch (e) {
+    // 客户端走了不是上游的错：不能因此给账号记冷却，也不能换账号再打一次。
+    // 先翻译再停：`watch.gone()` 靠那个信号判，信号要先在才能判准。
+    const failure = asClientGone(e, watch);
+    watch.stop();
+    throw failure;
+  }
 
   if (!stream) {
-    const json = await upstream.json();
+    let json: any;
+    try {
+      json = await upstream.json();
+    } catch (e) {
+      // 客户端走了不是上游的错：账号不该记冷却，这个请求也不该再打一次。
+      const failure = asClientGone(e, watch);
+      if (failure instanceof ClientGoneError) {
+        settle.failure(failure);
+        throw failure;
+      }
+      throw e;
+    } finally {
+      watch.stop();
+    }
     deliverJson(out, dialect, "openai", json, route.label ?? upstreamModel(route), ctx.onUsage);
     settle.success();
     return;
   }
+  // 流式那条路：答复是边读边发的，客户端走了由答复那一层管（见
+  // lib/router/deliver.ts 的 replyState）。这里的 watch 在上游回第一帧之前就
+  // 停了 —— 流式那条路的客户端走了，靠的是答复那一层自己的监听器与看门狗。
+  watch.stop();
 
   try {
     await deliverOpenAIStream(

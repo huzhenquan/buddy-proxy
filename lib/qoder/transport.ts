@@ -84,6 +84,8 @@ export interface QoderRequestOptions {
   /** Which provider (which account) to talk to. */
   providerId?: string;
   region?: QoderRegion;
+  /** 客户端走了就断掉这个信号：上游还在算就是在计费。 */
+  signal?: AbortSignal;
 }
 
 /** The session ids the gateway expects on every request. */
@@ -152,6 +154,8 @@ export async function qoderChatCompletion(
     method: "POST",
     headers,
     body: JSON.stringify(buildBody(body, opts.stream)),
+    // 客户端走了就把这次请求掐掉：上游还在算就是在计费，账号还占着。
+    signal: opts.signal,
   });
   if (r.status === 401) {
     // The client sees the gateway's status; the upstream's own status says

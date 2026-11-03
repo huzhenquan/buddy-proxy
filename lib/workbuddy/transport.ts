@@ -363,7 +363,7 @@ export async function fetchWorkBuddyCatalog(
 }
 
 /** Fold an upstream stream into one chat.completion object. */
-export async function aggregateStream(response: Response, model: string): Promise<any> {
+export async function aggregateStream(response: Response, model: string, signal?: AbortSignal): Promise<any> {
   const content: string[] = [];
   const reasoning: string[] = [];
   const toolCalls = new Map<number, { id: string; type: string; function: { name: string; arguments: string } }>();
@@ -372,48 +372,57 @@ export async function aggregateStream(response: Response, model: string): Promis
   let finish = "stop";
 
   if (response.body) {
-    for await (const chunk of readOpenAIChunks(response.body)) {
-      if (!chunk) continue;
-      // A failure can arrive as a normal frame with an error in it. The
-      // official client reads the body and classifies the error; without that
-      // the agent sees an empty answer and no reason.
-      if (chunk.error) {
-        const error = chunk.error as any;
-        throw new AuthError(
-          `upstream error (${error.code ?? error.type ?? "unknown"})`,
-          typeof error.message === "string" ? error.message : JSON.stringify(error).slice(0, 300),
-          502,
-        );
-      }
-      // 上游有时用 200 回一个错（WorkBuddy 的渠道校验就是）：正文里只有业务
-      // 码，没有 error 字段。当成正常的帧的话，客户端收到一个空的 200 答复，
-      // 看着像模型答了个空，理由也没有（2026-11-03，作者复查发现）。
-      if (isBusinessErrorEnvelope(chunk)) {
-        const code = businessCodeOfPayload(chunk) ?? 0;
-        const said = typeof chunk.msg === "string" ? chunk.msg : typeof chunk.message === "string" ? chunk.message : "";
-        throw withBusinessCode(
-          new AuthError(`upstream rejected the request (${code})`, said.slice(0, 300) || "upstream rejected the request", 502),
-          code,
-        );
-      }
-      if (chunk.id) id = chunk.id;
-      if (chunk.usage) usage = chunk.usage;
-      for (const choice of chunk.choices ?? []) {
-        const delta = choice.delta ?? {};
-        if (typeof delta.content === "string") content.push(delta.content);
-        if (typeof delta.reasoning_content === "string") reasoning.push(delta.reasoning_content);
-        if (choice.finish_reason) finish = choice.finish_reason;
-        for (const call of delta.tool_calls ?? []) {
-          const index = typeof call.index === "number" ? call.index : toolCalls.size;
-          const entry = toolCalls.get(index) ?? { id: call.id ?? "", type: "function", function: { name: "", arguments: "" } };
-          if (call.id) entry.id = call.id;
-          if (call.type) entry.type = call.type;
-          if (call.function?.name) entry.function.name += call.function.name;
-          if (typeof call.function?.arguments === "string") entry.function.arguments += call.function.arguments;
-          toolCalls.set(index, entry);
+    try {
+      for await (const chunk of readOpenAIChunks(response.body, signal)) {
+        if (!chunk) continue;
+        // A failure can arrive as a normal frame with an error in it. The
+        // official client reads the body and classifies the error; without that
+        // the agent sees an empty answer and no reason.
+        if (chunk.error) {
+          const error = chunk.error as any;
+          throw new AuthError(
+            `upstream error (${error.code ?? error.type ?? "unknown"})`,
+            typeof error.message === "string" ? error.message : JSON.stringify(error).slice(0, 300),
+            502,
+          );
+        }
+        // 上游有时用 200 回一个错（WorkBuddy 的渠道校验就是）：正文里只有业务
+        // 码，没有 error 字段。当成正常的帧的话，客户端收到一个空的 200 答复，
+        // 看着像模型答了个空，理由也没有（2026-11-03，作者复查发现）。
+        if (isBusinessErrorEnvelope(chunk)) {
+          const code = businessCodeOfPayload(chunk) ?? 0;
+          const said = typeof chunk.msg === "string" ? chunk.msg : typeof chunk.message === "string" ? chunk.message : "";
+          throw withBusinessCode(
+            new AuthError(`upstream rejected the request (${code})`, said.slice(0, 300) || "upstream rejected the request", 502),
+            code,
+          );
+        }
+        if (chunk.id) id = chunk.id;
+        if (chunk.usage) usage = chunk.usage;
+        for (const choice of chunk.choices ?? []) {
+          const delta = choice.delta ?? {};
+          if (typeof delta.content === "string") content.push(delta.content);
+          if (typeof delta.reasoning_content === "string") reasoning.push(delta.reasoning_content);
+          if (choice.finish_reason) finish = choice.finish_reason;
+          for (const call of delta.tool_calls ?? []) {
+            const index = typeof call.index === "number" ? call.index : toolCalls.size;
+            const entry = toolCalls.get(index) ?? { id: call.id ?? "", type: "function", function: { name: "", arguments: "" } };
+            if (call.id) entry.id = call.id;
+            if (call.type) entry.type = call.type;
+            if (call.function?.name) entry.function.name += call.function.name;
+            if (typeof call.function?.arguments === "string") entry.function.arguments += call.function.arguments;
+            toolCalls.set(index, entry);
+          }
         }
       }
+    } catch (e) {
+      // 客户端走了：流是我们自己掐掉的，不是上游的错（上游的错要记冷却）。
+      if (signal?.aborted) throw new ClientGoneError();
+      throw e;
     }
+    // 客户端走了：流是空的或者被掐断的，不能当成一份完整的答复送出去 ——
+    // 客户端会收到一个空的 200，而它其实一个字都没拿到。
+    if (signal?.aborted) throw new ClientGoneError();
   }
 
   const message: Json = { role: "assistant", content: content.join("") };

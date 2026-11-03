@@ -18,29 +18,88 @@
  * 复数与连字符也算：`tokens` / `accessTokens` / `user-id` 一样要抹。
  */
 const SENSITIVE_FIELD =
-  /(^|_)(tokens?|secrets?|passwords?|passwds?|cookies?|credentials?|mails?|emails?|uids?|ids?|keys?|user_?ids?|account_?ids?|session_?ids?|api_?keys?|access_?keys?|private_?keys?)(_|$)/i;
+  /(^|_)(tokens?|secrets?|passwords?|passwds?|cookies?|credentials?|mails?|emails?|uids?|ids?|keys?|uuids?|user_?ids?|account_?ids?|session_?ids?|api_?keys?|access_?keys?|private_?keys?)(_|$)/i;
 
 /** 抹掉的值。 */
 const REDACTED = "[已抹去]";
 
 /**
- * 名字里带 `id`、但**不是**账号标识的那些。
+ * 名字里带 `id`、带 `token`，但**不是**账号标识的那些。
  *
- * `id` 该抹（最常见的账号标识就是它），但请求 id、追踪 id 抹了就没法跟
- * 上游的日志对上了 —— 排查时那正是要找的东西。
+ * 两组：
  *
- * 录到的真实上游正文里，这些名字装的是**每请求随机**的值（`requestId` 是
- * 随机 hex，`request_id` 是随机 UUID），账号标识用的是别的名字（`user_id`、
- * `uid`、`enterpriseId`、`account_id`）—— 那些不在白名单里，照样被抹。
+ *   · 请求 id、追踪 id —— 每请求随机的值。抹了就没法跟上游的日志对上了，
+ *     排查时那正是要找的东西。（账号标识用的是别的名字：`user_id`、`uid`、
+ *     `enterpriseId`、`account_id` —— 那些不在白名单里，照样被抹。）
+ *   · 用量里的那些数 —— token 数不是凭据。上游的正文里最要紧的就是这些数
+ *     （答了 200 却没内容的时候，警告就是靠它们判断的），抹掉等于把日志里
+ *     最要读的那部分抹了（2026-11-03，作者复查发现）。
  */
-const SAFE_ID_FIELDS = new Set([
+const SAFE_FIELDS = new Set([
+  // 请求 id 与追踪 id（连同带 uuid 的请求 id —— 它是随机的，不是账号标识）。
   "request_id",
+  "request_uuid",
   "req_id",
   "trace_id",
   "log_id",
   "x_request_id",
   "x_trace_id",
+  // 用量：数（复数与单数两种写法都接 —— 上游两样都有）。
+  "prompt_tokens",
+  "prompt_token",
+  "completion_tokens",
+  "completion_token",
+  "total_tokens",
+  "total_token",
+  "input_tokens",
+  "input_token",
+  "output_tokens",
+  "output_token",
+  "cached_tokens",
+  "cached_token",
+  "reasoning_tokens",
+  "reasoning_token",
+  "audio_tokens",
+  "audio_token",
+  "thinking_tokens",
+  "thinking_token",
+  "cache_read_input_tokens",
+  "cache_creation_input_tokens",
+  "prompt_cache_hit_tokens",
+  "prompt_cache_miss_tokens",
+  "prompt_cache_write_tokens",
+  "completion_thinking_tokens",
+  "accepted_prediction_tokens",
+  "rejected_prediction_tokens",
+  "prompt_tokens_details",
+  "completion_tokens_details",
+  // 请求里的那些上限：也不是凭据。
+  "max_tokens",
+  "max_token",
+  "max_output_tokens",
+  "max_completion_tokens",
+  "max_input_tokens",
+  "budget_tokens",
+  "thinking_budget_tokens",
+  "input_cached_tokens",
+  "input_uncached_tokens",
+  // 模型 id：查问题的时候要看是哪个模型答的。
+  "model_id",
 ]);
+
+/**
+ * UUID 形状。
+ *
+ * 账号标识最常见的样子。按字段名抹的那一张表只接得住表里有的名字 —— 上游
+ * 换个字段名（`account`、`sub`、`openId`…）就接不住了。UUID 不管叫什么都在
+ * 那里，所以它是最后一道防线（2026-11-03，作者复查发现）。
+ *
+ * 请求 id 例外：字段名说了它是请求 id（`request_id`、`trace_id`…），那就留
+ * 着 —— 抹了就没法跟上游的日志对上。字段名没说的一律抹。
+ */
+const UUID_SOURCE = "\\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b";
+/** 把字符串里 UUID 形状的东西都抹掉。 */
+const UUID_SHAPE_ALL = new RegExp(UUID_SOURCE, "gi");
 
 /**
  * 驼峰拆成下划线：`accessToken` → `access_Token`。
@@ -60,16 +119,21 @@ function normalizeKey(key: string): string {
 /** 这个字段的值要不要抹掉。 */
 function isSensitiveField(key: string): boolean {
   const name = normalizeKey(key);
-  if (SAFE_ID_FIELDS.has(name)) return false;
+  if (SAFE_FIELDS.has(name)) return false;
   return SENSITIVE_FIELD.test(name);
+}
+
+/** 这个字段是不是白名单里的（不是账号标识）。 */
+function isSafeField(key: string): boolean {
+  return SAFE_FIELDS.has(normalizeKey(key));
 }
 
 /**
  * 把一段正文里的敏感字段去掉，只留能读懂这句话的部分。
  *
- * 去掉的是：邮箱、令牌样的长串（JWT 那种带点的也算）、以及名字里带着
- * token / secret / key / cookie / uid / id 的字段的值。正文是 JSON 就按 JSON
- * 拆，拆不动就按文本里的模式换。
+ * 去掉的是：邮箱、令牌样的长串（JWT 那种带点的也算）、UUID 形状的标识、
+ * 以及名字里带着 token / secret / key / cookie / uid / id 的字段的值。正文是
+ * JSON 就按 JSON 拆，拆不动就按文本里的模式换。
  *
  * SSE 帧（`data: {...}`）是**一帧一帧**地拆。流式上游的正文就是多帧，整段
  * 当一坨去 parse 一定失败 —— 那整条「按字段抹」的规则对流式上游就一点用没有
@@ -89,10 +153,13 @@ export function scrubForLog(text: string, maxLength = 200): string {
   } else {
     // 不是 SSE：整段当 JSON 拆（拆不动就当文本）。
     const parsed = parseMaybeJson(original);
-    out =
-      parsed && typeof parsed === "object"
-        ? JSON.stringify(scrubValue(parsed))
-        : original.replace(/\s+/g, " ").trim();
+    if (parsed && typeof parsed === "object") {
+      out = JSON.stringify(scrubValue(parsed));
+    } else {
+      // 不是 JSON：按文本走。UUID 形状的账号标识躲过了字段名那一张表，
+      // 这里兜底 —— 纯文本里没有字段名可看，UUID 一律抹。
+      out = scrubUuids(original.replace(/\s+/g, " ").trim());
+    }
   }
   // 最后一遍按形态抹（邮箱、令牌样的长串、JWT）：JSON 里那些装在字符串值里的
   // 也要抹 —— 按字段名抹不到它们。
@@ -109,7 +176,7 @@ function scrubFrame(frame: string): string {
   if (parsed && typeof parsed === "object") {
     return JSON.stringify(scrubValue(parsed));
   }
-  return frame.replace(/\s+/g, " ").trim();
+  return scrubUuids(frame.replace(/\s+/g, " ").trim());
 }
 
 /** 按字段名把值抹掉。 */
@@ -122,8 +189,20 @@ function scrubValue(value: unknown, key = ""): unknown {
     ]);
     return Object.fromEntries(entries);
   }
-  if (typeof value === "string" && isSensitiveField(key)) return REDACTED;
+  if (typeof value === "string") {
+    if (isSensitiveField(key)) return REDACTED;
+    // 请求 id：留着（抹了就没法跟上游的日志对上）。
+    if (isSafeField(key)) return value;
+    // UUID 形状的标识：这个字段名不在表里（`account`、`sub`…），但值是账号
+    // 标识 —— 兜底抹掉。字段名说了它是请求 id，那就留着。
+    return scrubUuids(value);
+  }
   return value;
+}
+
+/** 把字符串里 UUID 形状的东西抹掉。 */
+function scrubUuids(text: string): string {
+  return text.replace(UUID_SHAPE_ALL, REDACTED);
 }
 
 /**
