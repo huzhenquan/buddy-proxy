@@ -6,6 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Json } from "../lib/json.ts";
 
 // The path of this file, as the platform sees it. `new URL(...).pathname` is
 // a POSIX path — on Windows it starts with a slash ("/D:/projects/..."), and
@@ -46,6 +47,24 @@ export interface Fixture {
   status: number;
   headers: Record<string, string>;
   body: string;
+  /**
+   * The request body that was sent, as it was sent.
+   *
+   * 渠道校验认的是系统提示词开头那句（见 lib/workbuddy/identity.ts）：录下
+   * 整个请求体，是为了让「同一句请求，只差开头那句」这件事能被机械地比对
+   * —— 把被拦那次的开头那句换成放行那次的那句，两个请求体应当完全相等。
+   * 手抄几个字段做不到这件事（抄错一个字符没人会发现）。
+   *
+   * 请求体里没有凭据：它是发给上游的正文，身份在请求头里。
+   */
+  requestBody?: Json;
+  /**
+   * The names of the request headers (not their values).
+   *
+   * 值里有令牌与每次请求随机的 id，名字里没有 —— 名字够证明「两次用的是
+   * 同一套请求头」，又不把任何东西带进仓库。
+   */
+  requestHeaderNames?: string[];
 }
 
 export function writeFixture(name: string, fixture: Fixture): void {

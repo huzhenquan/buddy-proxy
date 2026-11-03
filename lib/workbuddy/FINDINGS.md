@@ -15,6 +15,21 @@
 那次答复录下来了：[`test/fixtures/workbuddy-channel-check-11128.json`](../../test/fixtures/workbuddy-channel-check-11128.json)，
 回归在 [`test/workbuddy-check.ts`](../../test/workbuddy-check.ts) 里。
 
+放行的那次也录了：[`test/fixtures/workbuddy-channel-check-accepted.json`](../../test/fixtures/workbuddy-channel-check-accepted.json)。
+两份是对照 —— 同一个账号、同一套请求头、同一个模型、同一个问题，**只差系统提示词开头那句**：
+
+| fixture | 开头那句 | 上游的答复 |
+|---|---|---|
+| `workbuddy-channel-check-accepted.json` | `You are CodeBuddy Code.` | 200，流式答复（`data:` 帧 + `[DONE]`） |
+| `workbuddy-channel-check-11128.json` | `You are Claude Code, Anthropic's official CLI for Claude.` | 400，业务码 11128 |
+
+两份 fixture 各自记着当时发出去的**整个请求体**（`requestBody`）—— 「只差开头那句」这句话
+因此能被机械地比对：把被拦那次请求体里的开头那句换成放行那次的那句，两个请求体完全相等
+（模型、参数、user 那句话，一个字都没差）。回归断的就是这个。
+
+请求头只记了**名字**（`requestHeaderNames`），没记值 —— 值里有令牌与每次请求随机的 id；
+名字够证明两次用的是同一套请求头。
+
 ### 它认的是系统提示词开头那句自报家门
 
 请求头是模拟端写死的，不是判据。判据是**系统提示词第一行那句自我介绍**。
@@ -63,6 +78,15 @@
 
 所以取的是**第一个非零的**，不是第一个存在的：用 `??` 会拿到那个 0，缓存率看着像全 miss，
 其实命中了 99.8%。口径在 `lib/dialect/cache.ts`。
+
+放行那次录下来的 usage 把上游真的形状留住了（`workbuddy-channel-check-accepted.json`）：
+`prompt_tokens_details.cached_tokens`、`prompt_cache_hit_tokens`、`prompt_cache_miss_tokens`、
+`cache_read_input_tokens`、`cache_creation_input_tokens`、`prompt_cache_write_tokens`、
+顶层的 `cached_tokens` —— 一次答复里这些都报。回归里盯着前两个都在。
+
+（那份样本问的是「say ok」，没什么可缓存的，所以两个字段的值都是 0 —— 它证明的是
+「字段在」，不是「取第一个非零」那条口径。那条口径由 `test/dialect-cache-check.ts`
+拿真数字断。）
 
 两种方言的算法本身也不一样：OpenAI 的 `prompt_tokens` 是**全部**输入；Anthropic 的
 `input_tokens` 只算**没命中缓存**的余量，命中读到的（`cache_read_input_tokens`）与

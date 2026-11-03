@@ -169,21 +169,97 @@ buildChatBody(shared, model);
 check("the caller's body is not rewritten", String((shared.messages[0] as any).content) === foreign, String((shared.messages[0] as any).content));
 
 console.log("");
-console.log("the recorded channel check");
+console.log("the two recorded channel checks");
 
-// 上游拒了非官方客户端的那一次答复，录下来了（fixtures 里）。它证明了
-// 「渠道校验」这件事存在，也证明了业务码是 11128 —— 日志与面板要靠它认出
-// 这是风控，不是参数写错。
+// 同一句请求，只差系统提示词开头那句自报家门 —— 一次放行，一次被拦。两次
+// 都对着真的 WorkBuddy 上游打的，答复都录下来了（fixtures 里）。
+//
+// 这两条对照是「渠道校验认的是开头那句」这件事的凭据。两个 fixture 都记着
+// 当时发出去的**整个请求体**：把被拦那次的开头那句换成放行那次的那句，两个
+// 请求体就完全相等 —— 别的（模型、参数、user 那句话）一个字都没差。
+//
+// 用「整个请求体」而不是手抄几个字段：抄错一个字符没有人会发现。
 {
   const { readFixture } = await import("./fixture-name.ts");
-  const fixture = readFixture("workbuddy-channel-check-11128.json");
-  const body = fixture?.body ?? "";
   const { businessCodeOfBody } = await import("../lib/upstream-status.ts");
-  check("录下来的答复在", Boolean(fixture), "fixture missing");
-  check("它是 400", fixture?.status === 400, String(fixture?.status));
-  check("业务码是 11128", businessCodeOfBody(body) === 11128, String(businessCodeOfBody(body)));
-  check("正文里说的是渠道校验", body.includes("unapproved channel"), body.slice(0, 120));
-  check("正文里没有账号标识", !body.includes("@") && !body.includes("user_id"), body.slice(0, 120));
+  const { DEFAULT_SYSTEM, rewriteSystemContent } = await import("../lib/workbuddy/identity.ts");
+  const { aggregateStream } = await import("../lib/workbuddy/transport.ts");
+  const { cachedInputOfOpenAI } = await import("../lib/dialect/cache.ts");
+
+  const accepted = readFixture("workbuddy-channel-check-accepted.json");
+  const rejected = readFixture("workbuddy-channel-check-11128.json");
+
+  check("放行的那次录下来了", Boolean(accepted), "fixture missing");
+  check("被拦的那次录下来了", Boolean(rejected), "fixture missing");
+  check("它们打的是同一个上游", accepted?.upstream === rejected?.upstream, `${accepted?.upstream} / ${rejected?.upstream}`);
+
+  // 两次的请求体：把开头那句换掉，两个请求体应当完全相等。
+  const acceptedBody = accepted?.requestBody as any;
+  const rejectedBody = rejected?.requestBody as any;
+  const systemOf = (body: any): string => String(body?.messages?.[0]?.content ?? "");
+  const firstLineOf = (body: any): string => systemOf(body).split("\n")[0];
+
+  check("放行那次录下了请求体", Boolean(acceptedBody), "no request body");
+  check("被拦那次录下了请求体", Boolean(rejectedBody), "no request body");
+  check("两次的请求头一样", JSON.stringify([...(accepted?.requestHeaderNames ?? [])].sort()) === JSON.stringify([...(rejected?.requestHeaderNames ?? [])].sort()), `${accepted?.requestHeaderNames?.length} / ${rejected?.requestHeaderNames?.length}`);
+
+  // 把被拦那次的开头那句换成放行那次的那句 —— 两个请求体应当完全相等。
+  // 这一条把「别的都一样」变成机械的比对。
+  const rewritten = JSON.parse(JSON.stringify(rejectedBody));
+  rewritten.messages[0].content = systemOf(rejectedBody).replace(
+    firstLineOf(rejectedBody),
+    firstLineOf(acceptedBody),
+  );
+  check("换掉开头那句之后，两个请求体完全相等", JSON.stringify(rewritten) === JSON.stringify(acceptedBody), JSON.stringify(rewritten));
+  check("开头那句本来不一样", firstLineOf(acceptedBody) !== firstLineOf(rejectedBody), `${firstLineOf(acceptedBody)} / ${firstLineOf(rejectedBody)}`);
+
+  // 放行的那次：200，流式答复，里面有正常的帧。
+  check("放行的那次是 200", accepted?.status === 200, String(accepted?.status));
+  check("放行的那次是流", String(accepted?.headers?.["content-type"] ?? "").includes("event-stream"), String(accepted?.headers?.["content-type"]));
+  check("放行的那次有收尾帧", (accepted?.body ?? "").includes("data: [DONE]"), (accepted?.body ?? "").slice(-120));
+
+  // 「不是错误信封」用生产解析器证明：aggregateStream 见到信封会抛错，跑通
+  // 本身就是它不是信封的证据，同时说明整条流能被解析成一次答复。
+  let aggregated: any = null;
+  let aggregateError: unknown = null;
+  try {
+    aggregated = await aggregateStream(
+      new Response(accepted?.body ?? "", { headers: { "content-type": "text/event-stream" } }),
+      "hy3",
+    );
+  } catch (e) {
+    aggregateError = e;
+  }
+  check("放行那次能解析成一次答复", aggregateError === null, String(aggregateError));
+  check("放行那次答了话", aggregated?.choices?.[0]?.message?.content === "ok", String(aggregated?.choices?.[0]?.message?.content));
+  check("放行那次报了用量", Boolean(aggregated?.usage), JSON.stringify(aggregated?.usage ?? {}));
+
+  // 缓存命中数在上游的 usage 里报了两次：prompt_tokens_details.cached_tokens
+  // 与 prompt_cache_hit_tokens。这份样本两个都是 0（问的是「say ok」，没什么
+  // 可缓存的），所以这里只断「两个字段都在」；「取第一个非零」那条口径由
+  // test/dialect-cache-check.ts 用真数字断。
+  check("缓存命中数报了两次", aggregated?.usage?.prompt_tokens_details?.cached_tokens !== undefined && aggregated?.usage?.prompt_cache_hit_tokens !== undefined, JSON.stringify(aggregated?.usage ?? {}));
+  // 少了 `?.` 是故意的：usage 不在的时候这句要炸（空过不算过），而不是
+  // 悄悄当成 0。
+  check("取出来的是 0（这份样本没命中）", aggregated?.usage ? cachedInputOfOpenAI(aggregated.usage) === 0 : false, String(cachedInputOfOpenAI(aggregated?.usage)));
+
+  // 被拦的那次：400，业务码 11128，正文说的是渠道校验。
+  check("被拦的那次是 400", rejected?.status === 400, String(rejected?.status));
+  check("被拦的那次业务码是 11128", businessCodeOfBody(rejected?.body ?? "") === 11128, String(businessCodeOfBody(rejected?.body ?? "")));
+  check("被拦那次正文里说的是渠道校验", (rejected?.body ?? "").includes("unapproved channel"), (rejected?.body ?? "").slice(0, 120));
+  check("被拦那次正文里没有账号标识", !(rejected?.body ?? "").includes("@") && !(rejected?.body ?? "").includes("user_id"), (rejected?.body ?? "").slice(0, 120));
+
+  // 录下来的时候各自用的开头那句。
+  check("放行那次开头是官方那句", firstLineOf(acceptedBody) === DEFAULT_SYSTEM, firstLineOf(acceptedBody));
+  check("被拦那次开头是 Claude Code 那句", firstLineOf(rejectedBody).startsWith("You are Claude Code"), firstLineOf(rejectedBody));
+
+  // 关键的那一条：把被拦那次用的开头那句改写掉，得到的就是放行那次用的那句。
+  // 模拟端做的正是这件事（rewriteSystemContent）。
+  check(
+    "改写被拦那次的那句，得到的是放行那次的那句",
+    rewriteSystemContent(firstLineOf(rejectedBody)) === firstLineOf(acceptedBody),
+    String(rewriteSystemContent(firstLineOf(rejectedBody))),
+  );
 }
 
 console.log("");
