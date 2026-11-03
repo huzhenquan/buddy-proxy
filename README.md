@@ -357,3 +357,36 @@ and have to be logged in again. Mount one directory and keep it.
 No. A session has one holder (see above), and the platform revokes the whole
 account's sessions when it sees a replayed token. Give each instance its own
 accounts.
+
+## Sending a patch
+
+Every change is looked at by two independent reviewers before it merges, and
+both work from the same checklist. The fastest path is to run that checklist
+yourself first — until someone else reads the diff, you are the reviewer.
+
+- [`docs/reference/pr-review-checklist.md`](docs/reference/pr-review-checklist.md)
+  — the defect shapes that keep coming back here, each with the check that
+  catches it.
+- [`docs/reference/pr-review-process.md`](docs/reference/pr-review-process.md)
+  — how the two channels run, what a review has to answer, and what happens to
+  the findings.
+
+What the patch should carry when you open it:
+
+- **The gate**: `mise run check` — both typechecks and both test suites. One
+  command; do not assemble your own subset.
+- **The privacy scan**: `mise run privacy`, plus your own look at
+  `git diff --cached`. The scan reads the working tree, the commit takes the
+  index, so a fix that is not staged is a fix that is not there.
+- **The seven rules**: §11 of the checklist gets a verdict per rule — held,
+  violated, or untouched, and untouched needs the reason.
+- **The counter-proof**: for each fix, the thing you did that would have failed
+  if the fix were wrong. A test that passes before and after proves nothing.
+- **Generated code**: touched `proto/**`? `mise run proto` is yours to run, in
+  both places, before the PR.
+- **Commit messages**: say what the change does, not what it replaced.
+
+Reviews here are blunt on purpose: a comment names the file, the line and the
+observation behind it. An open blocker means the patch does not merge — and
+not on the third revision either, until that blocker is closed. If you
+disagree with a finding, evidence closes it faster than a silent push.
