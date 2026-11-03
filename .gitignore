@@ -8,8 +8,16 @@ free_models.json
 # fingerprint has to stay the same across rebuilds.
 identity.salt
 
-# Local notes and tooling state, not part of the project
-docs/
+# Local notes and tooling state, not part of the project.
+#
+# docs/ 下只有 docs/reference/ 入库：那是长期可查的设计、上游协议与流程文档。
+# 其余（任务书、会话日志、一次性报告）留本机 —— 它们带真实账号 id、本机路径，
+# 或者只在当时有意义。新文档放进 docs/reference/ 之前先过脱敏。
+/docs/*
+!/docs/reference
+
+# 第三方 skill 自带的 docs（原先被 docs/ 那条一起带住了，保持原样）
+.agents/skills/**/docs/
 .cortexkit/
 problem.md
 
