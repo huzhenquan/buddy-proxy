@@ -13,7 +13,9 @@
 //      换一个也一样没人要；而且那个上游白花钱。
 //
 // 这三件事在非流式那条路上最容易坏：答复要等整个上游的答复读完才发出去，客户端
-// 正好在这中间走。Qoder 的新协议非流式就是这么消费的（await upstream.json()）。
+// 正好在这中间走。Qoder 的新协议非流式就是这么消费的（await upstream.json()）；
+// WorkBuddy 补的是另一个窗口 —— 上游连答复的头都还没发、workbuddyChat 还挂在
+// cliFetch 上的时候（2026-11-03，作者第三轮点名）。
 
 import fs from "node:fs";
 import http from "node:http";
@@ -56,6 +58,21 @@ const qoderGot = new Promise<void>((resolve) => {
 /** Qoder 那个请求被掐断了没有（客户端走了，网关把上游停了）。 */
 let qoderAborted = false;
 
+/** Qoder 的 chat 端点被打了几次：客户端走了之后，谁都不该再打第二次。 */
+let qoderHits = 0;
+
+/** 假上游收到 WorkBuddy 那个请求了没有（客户端要走，就等这个）。 */
+let workbuddyGotIt: () => void = () => {};
+const workbuddyGot = new Promise<void>((resolve) => {
+  workbuddyGotIt = resolve;
+});
+
+/** WorkBuddy 那个请求被掐断了没有（客户端走了，网关把上游停了）。 */
+let workbuddyAborted = false;
+
+/** WorkBuddy 的 chat 端点被打了几次：客户端走了之后，谁都不该再打第二次。 */
+let workbuddyHits = 0;
+
 const upstream = http.createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on("data", (c: Buffer) => chunks.push(c));
@@ -68,6 +85,7 @@ const upstream = http.createServer((req, res) => {
     };
     if (url.includes("/model/v1/chat/completions")) {
       // Qoder：上游在想。客户端在这个窗口里走掉。
+      qoderHits++;
       qoderGotIt();
       const timer = setTimeout(() => {
         json(200, {
@@ -81,6 +99,27 @@ const upstream = http.createServer((req, res) => {
       res.on("close", () => {
         // 答复还没写出来连接就断了：网关把上游掐掉了。
         if (!res.writableEnded) qoderAborted = true;
+        clearTimeout(timer);
+      });
+      return;
+    }
+    if (url.includes("/v2/chat/completions")) {
+      // WorkBuddy：上游在想 —— 连答复的头都还没发。客户端在这个窗口里走掉
+      // （workbuddyChat 还在等 cliFetch，这是作者第三轮指名要补的那条）。
+      workbuddyHits++;
+      workbuddyGotIt();
+      const timer = setTimeout(() => {
+        if (res.writableEnded || res.destroyed) return;
+        // 上游永远先回一条流（非流式也是流聚合出来的），答什么都行：客户端早走了。
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(
+          'data: {"id":"chatcmpl-fake","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n' +
+            "data: [DONE]\n\n",
+        );
+      }, THINK_MS);
+      res.on("close", () => {
+        // 答复还没写出来连接就断了：网关把上游掐掉了。
+        if (!res.writableEnded) workbuddyAborted = true;
         clearTimeout(timer);
       });
       return;
@@ -99,6 +138,7 @@ const upstreamBase = `http://127.0.0.1:${(upstream.address() as any).port}`;
 interface Gateway extends HarnessGateway {
   token: string;
   qoderId: string;
+  workbuddyId: string;
 }
 
 async function startGateway(): Promise<Gateway> {
@@ -108,6 +148,10 @@ async function startGateway(): Promise<Gateway> {
       QODER_GLOBAL_INFER_BASE: upstreamBase,
       QODER_GLOBAL_OPENAPI_BASE: upstreamBase,
       QODER_MAX_ATTEMPTS: "1",
+      WORKBUDDY_CHAT_BASE: upstreamBase,
+      // 认证与刷新走的是 ENDPOINTS 的基址，不是 chat 的：也指到假上游，
+      // 这样这条用例无论走到哪一步都一个真请求都不会发出去。
+      WORKBUDDY_CN_BASE: upstreamBase,
     },
   });
   const tokenFile = path.join(gw.dataDir, "admin-token");
@@ -121,7 +165,7 @@ async function startGateway(): Promise<Gateway> {
   );
   const now = Date.now();
 
-  const local: Gateway = { ...gw, token, qoderId: "" };
+  const local: Gateway = { ...gw, token, qoderId: "", workbuddyId: "" };
   const qoder = await call(local, "AddAccount", { platform: "qoder", alias: "Qoder" });
   const qoderId = String(qoder.body?.id ?? "");
   insertSecret.run(
@@ -145,8 +189,32 @@ async function startGateway(): Promise<Gateway> {
     }),
     now,
   );
+  // WorkBuddy 的账号与会话：会话形状与 test/fake-sessions.ts 那份一致。
+  const workbuddy = await call(local, "AddAccount", { platform: "workbuddy-cn", alias: "WorkBuddy" });
+  const workbuddyId = String(workbuddy.body?.id ?? "");
+  insertSecret.run(
+    `session:provider:${workbuddyId}`,
+    "session",
+    JSON.stringify({
+      accessToken: "test-access-token",
+      refreshToken: "test-refresh-token",
+      uid: "test-uid",
+      nickname: "test",
+      domain: "www.workbuddy.cn",
+      region: "cn",
+      generation: 1,
+      expiresAtMs: now + 365 * 24 * 3600 * 1000,
+      refreshExpiresAtMs: now + 365 * 24 * 3600 * 1000,
+      loginAtMs: now,
+      refreshedAtMs: now,
+    }),
+    now,
+  );
+  // 账号 id 要在：空的话下面的冷却断言会空转（WHERE provider_id = '' 什么也匹配不到）。
+  check("Qoder：账号 id 拿到了", qoderId !== "", qoderId);
+  check("WorkBuddy：账号 id 拿到了", workbuddyId !== "", workbuddyId);
   seed.close();
-  return { ...gw, token, qoderId };
+  return { ...gw, token, qoderId, workbuddyId };
 }
 
 async function call(gw: Gateway, method: string, body: unknown = {}): Promise<any> {
@@ -170,7 +238,7 @@ async function call(gw: Gateway, method: string, body: unknown = {}): Promise<an
  *
  * 走掉的时机是「上游已经在算了」—— 那正是要测的窗口。
  */
-function askAndLeave(gw: Gateway, model: string): Promise<void> {
+function askAndLeave(gw: Gateway, routePath: string, model: string, got: Promise<void>): Promise<void> {
   const body = JSON.stringify({
     model,
     max_tokens: 32,
@@ -182,7 +250,7 @@ function askAndLeave(gw: Gateway, model: string): Promise<void> {
       {
         host: "127.0.0.1",
         port: gw.port,
-        path: "/qoder/v1/chat/completions",
+        path: routePath,
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -200,7 +268,7 @@ function askAndLeave(gw: Gateway, model: string): Promise<void> {
     req.on("error", () => resolve());
     req.end(body);
     void (async () => {
-      await qoderGot;
+      await got;
       await sleep(100);
       req.destroy();
     })();
@@ -219,17 +287,43 @@ console.log("客户端走了：上游停、账号不背锅、不换目标");
   try {
     // 只有一个 Qoder 账号、一个目标。客户端走了不该记冷却，也不该换目标。
     // （只有一个目标，所以「不换目标」是「没有第二个可换」—— 但关键是别记冷却。）
-    await askAndLeave(gw, "glm-5.3");
+    await askAndLeave(gw, "/qoder/v1/chat/completions", "glm-5.3", qoderGot);
     // 给网关一点时间收尾（上游被掐断、账记完）。
     await sleep(1_500);
 
     check("上游被掐断了（它还在算就是在计费）", qoderAborted, "上游还在算");
+    check("上游只被打了一次（客户端走了就不该再打）", qoderHits === 1, String(qoderHits));
 
     const db = new DatabaseSync(path.join(gw.dataDir, "buddy.db"));
     const cooldowns = db
       .prepare("SELECT provider_id FROM cooldown WHERE provider_id = ?")
       .all(gw.qoderId) as unknown[];
     check("账号没有记冷却（客户端走了不是账号的错）", cooldowns.length === 0, JSON.stringify(cooldowns));
+
+    db.close();
+  } finally {
+    gw.stop();
+    await gw.stopAndWait();
+    fs.rmSync(gw.dataDir, { recursive: true, force: true });
+  }
+}
+
+{
+  // WorkBuddy 走的同一条断言：上游在等答复的头的时候客户端走了。这是
+  // workbuddyChat 还挂在 cliFetch 上的窗口 —— 作者第三轮点名的那条。
+  const gw = await startGateway();
+  try {
+    await askAndLeave(gw, "/workbuddy-cn/v1/chat/completions", "hy3", workbuddyGot);
+    await sleep(1_500);
+
+    check("WorkBuddy：上游被掐断了（它还在算就是在计费）", workbuddyAborted, "上游还在算");
+    check("WorkBuddy：上游只被打了一次（客户端走了就不该再打）", workbuddyHits === 1, String(workbuddyHits));
+
+    const db = new DatabaseSync(path.join(gw.dataDir, "buddy.db"));
+    const cooldowns = db
+      .prepare("SELECT provider_id FROM cooldown WHERE provider_id = ?")
+      .all(gw.workbuddyId) as unknown[];
+    check("WorkBuddy：账号没有记冷却（客户端走了不是账号的错）", cooldowns.length === 0, JSON.stringify(cooldowns));
 
     db.close();
   } finally {

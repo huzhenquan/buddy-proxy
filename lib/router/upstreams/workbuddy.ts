@@ -66,6 +66,9 @@ export async function toWorkBuddy(
           conversationId,
           model: ctx.workbuddyModel(model),
           signal: watch.signal,
+        }).catch((e) => {
+          // 客户端走了不是上游的错：策略看到的是这个，它才不会给账号记冷却。
+          throw asClientGone(e, watch);
         }),
       settle,
     );
